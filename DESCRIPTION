@@ -1,0 +1,19 @@
+Package: llperm
+Title: LikeLihood based Permutation of Regression Residuals (PRR) test
+Version: 0.0.0.9000
+Authors@R: 
+    person(given = "Markus",
+           family = "Viljanen",
+           role = c("aut", "cre"),
+           email = "markus.viljanen@rivm.nl",
+           comment = c(ORCID = "YOUR-ORCID-ID"))
+Description: What the package does (one paragraph).
+License: GPL (>= 3)
+Encoding: UTF-8
+LazyData: true
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.1.1
+Suggests: 
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
