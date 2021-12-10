@@ -12,10 +12,4 @@ We extend the original implementation in three ways:
 2. A categorical variable of interest with multiple levels
 3. Fit two models for count/zero component in zero-inflated models.
 
-# Installation
-
-`devtools::install_git("https://gitl01-int-p.rivm.nl/viljanem/llperm")`
-
-# Usage
-
-See the 'vignettes' folder.
+# Installation.
