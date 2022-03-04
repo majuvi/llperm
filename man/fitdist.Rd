@@ -11,7 +11,7 @@ fitdist(
   offsetx = NULL,
   offsetz = NULL,
   weights = NULL,
-  dist = c("negbin", "betabin", "zipoisson", "zinegbin", "zibinomial", "zibetabin"),
+  family,
   control = fitdist.control(...),
   ...
 )
@@ -29,11 +29,9 @@ fitdist(
 
 \item{weights}{weights for each observation}
 
-\item{dist}{specify the distribution}
+\item{family}{specify the distribution to fit}
 
 \item{control}{extra arguments for the fitting process}
-
-\item{linkobj}{link object to use for the zero component}
 }
 \value{
 list of likelihood and permutation based p-values

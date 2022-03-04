@@ -8,29 +8,21 @@
 #' @param offsetx offset for the count component
 #' @param offsetz offset for the zero component
 #' @param weights weights for each observation
-#' @param dist specify the distribution
+#' @param family specify the distribution to fit
 #' @param control extra arguments for the fitting process
-#' @param linkobj link object to use for the zero component
 #' @return list of likelihood and permutation based p-values
 #' @export
 fitdist <- function (X, Y, Z=NULL, offsetx=NULL, offsetz=NULL, weights=NULL,
-                     dist = c("negbin", "betabin", "zipoisson", "zinegbin", "zibinomial", "zibetabin"),
-                     control = fitdist.control(...), 
-					 linkobj = make.link("logit"), ...)
+                     family, control = fitdist.control(...), ...)
 {
-  dist <- match.arg(dist)
-  #TODO: implement gradient for binomial / beta-binomial
-  loglikfun <- switch(dist, negbin=NegBin, betabin=BetaBin, zipoisson = ziPoisson, zinegbin = ziNegBin, zibinomial=ziBinomial, zibetabin = ziBetaBin)
-  gradfun <- switch(dist, negbin=NULL, betabin=NULL, zipoisson = gradPoisson, zinegbin = gradNegBin, zibinomial=NULL, zibetabin = NULL)
 
-  zero.inflated <- startsWith(dist, "zi")
-  over.disperse <- dist %in% c("negbin", "betabin", "zinegbin", "zibetabin")
+  loglikfun <- family$loglikfun
+  gradfun   <- family$gradfun
+  zero.inflated  <- family$zero.inflated
+  over.dispersed <- family$over.dispersed
 
   if (control$trace) {
-    if (zero.inflated)
-      cat("Zero-inflated Count Model\n", dist, "\n", sep = "")
-    else
-      cat("Count Model\n", dist, "\n", sep = "")
+    print(family$family)
   }
 
   n <- NROW(Y)
@@ -48,30 +40,7 @@ fitdist <- function (X, Y, Z=NULL, offsetx=NULL, offsetz=NULL, weights=NULL,
   if (is.null(start)) {
     if (control$trace)
       cat("generating starting values...")
-    if (dist %in% c("negbin", "zipoisson", "zinegbin")) {
-      if (zero.inflated)
-        model_zero <- glm.fit(Z, as.integer(Y == 0), weights = weights, family = binomial(link = "logit"), offset = offsetz)
-      else
-        model_zero <- list(coefficients=NULL)
-      model_count <- glm.fit(X, Y, family = poisson(), weights = weights, offset = offsetx)
-      theta <- 1
-    } else if (dist %in% c("betabin", "zibinomial", "zibetabin")) {
-      y <- as.vector(Y[,1])
-      y.c <- as.vector(rowSums(Y))
-      phat <- y/y.c
-      phat[phat <= 0] <- 1/(2 * y.c[phat == 0])
-      phat[phat >= 1] <- 1 - 1/(2 * y.c[phat == 1])
-      if (zero.inflated)
-        model_zero <- lm.fit(Z, as.numeric(y == 0))
-      else
-        model_zero <- list(coefficients=NULL)
-      model_count <- lm.fit(X, log(phat/(1 - phat)))
-      model.p <- mean(y) / mean(y.c)
-      phihat <- (1/(mean(y.c) - 1)) * (var(y)/(mean(y.c) * model.p * (1 - model.p)) - 1)
-      theta <- phihat/(1 - phihat)
-    }
-    start <- list(count = model_count$coefficients, zero = model_zero$coefficients,
-                  theta = if (over.disperse) log(theta) else NULL)
+    start <- family$startfun(X, Y, Z, offsetx, offsetz, weights)
   }
 
   method <- control$method
@@ -92,7 +61,7 @@ fitdist <- function (X, Y, Z=NULL, offsetx=NULL, offsetz=NULL, weights=NULL,
   } else {
     coefz <- NULL
   }
-  if (over.disperse)
+  if (over.dispersed)
     theta <- fit$par[(kx + kz + 1)]
   else
     theta <- NULL
@@ -103,12 +72,12 @@ fitdist <- function (X, Y, Z=NULL, offsetx=NULL, offsetz=NULL, weights=NULL,
   })
   cols.count <- paste("count", colnames(X), sep = "_")
   cols.zero <- if (zero.inflated) paste("zero", colnames(Z), sep = "_") else NULL
-  cols.theta <- if (over.disperse) "theta" else NULL
+  cols.theta <- if (over.dispersed) "theta" else NULL
   colnames(vc) <- rownames(vc) <- c(cols.count, cols.zero, cols.theta)
-  mu <- exp(X %*% coefc + offsetx)[, 1]
+  mu <- family$count.link$linkinv(X %*% coefc + offsetx)[, 1]
   if (zero.inflated) {
-    phi <- linkobj$linkinv(Z %*% coefz + offsetz)[, 1]
-    Yhat <- (1 - phi) * mu
+    phi <- family$zero.link$linkinv(Z %*% coefz + offsetz)[, 1]
+    Yhat <- (1 - phi) * mu 
   } else {
     Yhat <- mu
   }
@@ -116,8 +85,8 @@ fitdist <- function (X, Y, Z=NULL, offsetx=NULL, offsetz=NULL, weights=NULL,
   nobs <- sum(weights > 0)
   rval <- list(
     coefficients = list(count = coefc, zero = coefz, theta=theta), vcov = vc,
-    residuals = res, fitted.values = Yhat, dist = dist, loglik = fit$value, n = nobs,
-    df.null = nobs - 2, df.residual = nobs - (kx + kz + (dist %in% c("negbin", "betabin"))),
+    residuals = res, fitted.values = Yhat, dist = family$family, loglik = fit$value, n = nobs,
+    df.null = nobs - 2, df.residual = nobs - (kx + kz + over.dispersed),
     converged = fit$convergence < 1,
     optim = fit, start = start,
     weights = if (identical(weights, rep.int(1, n))) NULL else weights,
@@ -125,6 +94,5 @@ fitdist <- function (X, Y, Z=NULL, offsetx=NULL, offsetz=NULL, weights=NULL,
                   zero = if (identical(offsetz, rep.int(0, n))) NULL else offsetz),
     contrasts = list(count = attr(X, "contrasts"),
                      zero = if(zero.inflated) attr(Z, "contrasts") else NULL))
-  #class(rval) <- "zeroinfl"
   return(rval)
 }

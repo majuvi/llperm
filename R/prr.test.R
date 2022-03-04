@@ -24,6 +24,7 @@
 #' @param contrasts contrasts to use for the model matrix
 #' @return list of likelihood and permutation based p-values
 #' @export
+
 prr.test <-
 function(formula, var, family=gaussian, data, nrep = 1000, seed=12345, Silent=TRUE, weights,  subset, na.action,
     start = NULL, etastart, mustart, offset, control = glm.control(...), model = TRUE, method = "glm.fit", x = FALSE, y = TRUE, contrasts = NULL, ...)

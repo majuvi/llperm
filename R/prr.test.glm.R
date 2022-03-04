@@ -4,6 +4,7 @@
 #'
 #' @param formula Formula that specifies the model
 #' @param data Data frame with the data
+#' @param family Specify the distribution to fit
 #' @param subset Take a given subset of the observations
 #' @param weights Weights to use for the observations
 #' @param na.action what to do with NA values
@@ -14,17 +15,19 @@
 #' @param method function that fits the model
 #' @return list of likelihood and permutation based p-values
 #' @export
-prr.test.new <- function (formula, data, subset, weights, na.action, offset, contrasts=NULL, test.var=NULL, n.rep=100, method="glm.fit.fixed", ...)
+		
+prr.test.glm <- function (formula, data, family=gaussian, subset, weights, na.action, start=NULL, etastart=NULL, mustart=NULL, control = glm.control(...),
+                          offset, contrasts=NULL, test.var=NULL, n.rep=100, seed=12345, model=TRUE, method="glm.fit", x=FALSE, y=TRUE, ...)
 {
-  cal <- match.call()
-  #if (is.character(family))
-  #    family <- get(family, mode = "function", envir = parent.frame())
-  #if (is.function(family))
-  #    family <- family()
-  #if (is.null(family$family)) {
-  #    print(family)
-  #    stop("'family' not recognized")
-  #}
+
+  if (is.character(family))
+     family <- get(family, mode = "function", envir = parent.frame())
+  if (is.function(family))
+     family <- family()
+  if (is.null(family$family)) {
+     print(family)
+     stop("'family' not recognized")
+  }
   if (missing(data))
     data <- environment(formula)
   mf <- match.call(expand.dots = FALSE)
@@ -70,33 +73,57 @@ prr.test.new <- function (formula, data, subset, weights, na.action, offset, con
   }
   cols.testvar <- term.labels[term.columns] == test.var
   # Predict test.var from other variables
-  fit <- lm.fit(X[,!cols.testvar], X[,cols.testvar])
+  fit <- lm.fit(X[,!cols.testvar, drop=F], X[,cols.testvar, drop=F])
   R   <- fit$residual
   if (is.null(dim(R)) | (length(dim(R)) == 1L))
     dim(R) <- c(length(R), 1)
 
   # Calculate observed p-value
-  X0 <- X[,!cols.testvar]
+  X0 <- X[,!cols.testvar, drop=F]
   XR <- cbind(X0, R)
   f     <- call(if (is.function(method)) "method" else method)
-  fit.1 <- eval(as.call(c(as.list(f), list(x = XR, y = Y, weights = weights, offset = offset, intercept = attr(mt, "intercept") > 0),
+  fit.1 <- eval(as.call(c(as.list(f), list(x = XR, y = Y, weights = weights, start = start,
+        etastart = etastart, mustart = mustart, offset = offset, family = family, control = control, intercept = attr(mt, "intercept") > 0),
                           substitute(...()))))
-  fit.2 <- eval(as.call(c(as.list(f), list(x = X0, y = Y, weights = weights, offset = offset, intercept = attr(mt, "intercept") > 0),
+  fit.2 <- eval(as.call(c(as.list(f), list(x = X0, y = Y, weights = weights, start = start,
+        etastart = etastart, mustart = mustart, offset = offset, family = family, control = control, intercept = attr(mt, "intercept") > 0),
                           substitute(...()))))
+  if (method == "glm.fit") { # loglik attribute is missing from base glm.fit
+    class(fit.1) <- c("glm", "lm")
+    fit.1$loglik <- logLik(fit.1)[1]
+    class(fit.2) <- c("glm", "lm")
+    fit.2$loglik <- logLik(fit.2)[1]
+  }
   ll.1  <- fit.1$loglik
   ll.2  <- fit.2$loglik
   lr.df <- fit.2$df.residual - fit.1$df.residual
   p.value.obs <- pchisq(2 * (ll.1 - ll.2), lr.df, lower.tail=F)
 
-  # Calculate simulated p-value
+  # Permutations: calculate simulated p-value
+  set.seed(seed)
   ll.r <- rep(0, length(n.rep))
   for (i in 1:n.rep) {
     rnd <- sample(1:nrow(X), replace = FALSE)
     XR  <- cbind(X0, R[rnd,])
-    fit.r <- eval(as.call(c(as.list(f), list(x = XR, y = Y, weights = weights, offset = offset, intercept = attr(mt, "intercept") > 0),
+    fit.r <- eval(as.call(c(as.list(f), list(x = XR, y = Y, weights = weights, start = start,
+        etastart = etastart, mustart = mustart, offset = offset, family = family, control = control, intercept = attr(mt, "intercept") > 0),
                             substitute(...()))))
+    if (method == "glm.fit") {
+      class(fit.r) <- c("glm", "lm")
+      fit.r$loglik <- logLik(fit.r)[1]
+    }
     ll.r[i] <- fit.r$loglik
   }
   p.value.sim <- mean(ll.1 < ll.r)
-  return(list(p.value.obs=p.value.obs, p.value.sim=p.value.sim))
+  
+  # Save model frame, model matrix, and response vector?
+  if (model)
+    fit.1$model <- mf
+  fit.1$na.action <- attr(mf, "na.action")
+  if (x)
+    fit.1$x <- X
+  if (!y)
+    fit.1$y <- NULL
+	
+  return(list(fit=fit.1, p.value.obs=p.value.obs, p.value.sim=p.value.sim))
 }
