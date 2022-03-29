@@ -124,6 +124,8 @@ prr.test.glm <- function (formula, data, family=gaussian, subset, weights, na.ac
     fit.1$x <- X
   if (!y)
     fit.1$y <- NULL
-	
-  return(list(fit=fit.1, p.value.obs=p.value.obs, p.value.sim=p.value.sim))
+  
+  results <- list(fit=fit.1, p.value.obs=p.value.obs, p.value.sim=p.value.sim)
+  class(results) <- "prr.test.glm"
+  return(results)
 }

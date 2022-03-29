@@ -22,51 +22,34 @@ Load the required libraries.
 
 ```{r, imports, message=FALSE, warning=FALSE}
 library(llperm)
-library(phyloseq)
 library(ggplot2)
 ```
 
+Use parallel processing (optional).
+
+```{r}
+library(foreach)
+library(doParallel)
+numCores <- 16 #detectCores()
+registerDoParallel(numCores) 
+```
+
+
 ## Load the data set
 
-Load the data set. We have three data frames: OTU table, taxonomy table, and person metadata.
+Load the data set. We have two data frames: OTU table and person metadata.
 
 ```{r, load_data}
 fn.sequence <- system.file("extdata", "VEGA_sequences.txt", package = "llperm")
-fn.taxonomy <- system.file("extdata", "VEGA_taxonomy.txt", package = "llperm")
-fn.metadata <- system.file("extdata", "VEGA metadata.txt", package = "llperm")
+fn.metadata <- system.file("extdata", "VEGA_metadata.txt", package = "llperm")
 
-otu.table    <- t(read.table(fn.sequence, sep="\t", header=T, row.names=1))
-otu.taxonomy <- read.table(fn.taxonomy, sep="\t", header=T, row.names=1, stringsAsFactors=T)
-otu.metadata <- read.table(fn.metadata, sep="\t", header=T, row.names=1)
-
-# Set the reference level to the most common category
-otu.metadata <- with(otu.metadata, data.frame(
-  Age = Age,
-  UrbanizationLevel = Urbanization_level,
-  Gender = relevel(factor(Gender), "Female"),
-  Diet = relevel(factor(group), "meateater"),
-  # Low education has only 4 observations
-  Education = factor(education, c("", "High", "Low", "Middle"), labels=c("MidLow", "High", "MidLow", "MidLow")), 
-  PetAnimals = relevel(factor(Pet_animals_at_home), "Yes"),
-  TravelToSE = relevel(factor(Travel.to.Southern..or.Eastern.Europe.in.the.past.6.months), "No"), 
-  row.names = rownames(otu.metadata)))
-
-# Take only persons with both microbiome information and demographic information
-sample.ids <- intersect(rownames(otu.table), rownames(otu.metadata))
-otu.table <- otu.table[sample.ids,]
-otu.metadata <- otu.metadata[sample.ids,]
-
+otu.table    <- read.table(fn.sequence, sep="\t", header=T, row.names=1)
+otu.metadata <- read.table(fn.metadata, sep="\t", header=T, row.names=1, stringsAsFactors=T)
 ```
 
-Take only those taxa with at least 10% prevalence
+These are all the taxa:
 
 ```{r}
-set.seed(42)
-sample.valid <- otu.metadata$Diet %in% c("meateater", "fisheater", "vegetarian", "vegan")
-otu.valid    <- (colSums(otu.table > 1) / nrow(otu.table)) >= 0.10
-
-otu.table <- otu.table[sample.valid, otu.valid]
-otu.metadata <- otu.metadata[sample.valid, ]
 otu.names <- colnames(otu.table)
 ```
 
@@ -82,8 +65,7 @@ otu.counts$library_size <- rowSums(otu.table)
 This is a data frame of relative abundances
 
 ```{r}
-otu.table.rel <- log((otu.table + 1) / rowSums(otu.table + 1))
-otu.relative <- cbind(otu.table.rel, otu.metadata)
+otu.relative <- cbind(log((otu.table + 1) / rowSums(otu.table + 1)), otu.metadata)
 otu.relative$DietRandom <- otu.relative$Diet[sample(1:nrow(otu.relative))] 
 otu.relative$Sample <- rownames(otu.relative)
 ```
@@ -119,139 +101,116 @@ otu.relative$DietVegRandom <- as.numeric(otu.relative$DietVegRandom == "yes")
 Apply the original glmperm implementation to the example OTU:
 
 ```{r}
-fit <- prr.test(ASV159 ~ DietVeg + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE, var = "DietVeg", data=otu.relative, family="gaussian", nrep=1000)
+fit <- prr.test(ASV159 ~ DietVeg + AgeCat + UrbanizationCat, var = "DietVeg", data=otu.relative, family="gaussian", nrep=1000)
 summary(fit)
 ```
 
 Apply the original glmperm implementation all OTUs, saving the likelihood and PRR test based p-values for Diet and DietRandom:
 
 ```{r, message=FALSE, warning=FALSE}
-pvals.data.obs  <- c()
-pvals.null.obs  <- c()
-pvals.data.sim  <- c()
-pvals.null.sim  <- c()
-for(taxa in otu.names) {
-  #print(taxa)
-  eq1 <- as.formula(sprintf("%s ~ DietVeg + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE", taxa))
-  eq2 <- as.formula(sprintf("%s ~ DietVegRandom + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE", taxa))
+results <- as.data.frame(foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+  taxa = otu.names[[i]]
+  eq1 <- as.formula(sprintf("%s ~ DietVeg + AgeCat + UrbanizationCat ", taxa))
+  eq2 <- as.formula(sprintf("%s ~ DietVegRandom + AgeCat + UrbanizationCat ", taxa))
   fit1 <- prr.test(eq1, data=otu.relative, var = "DietVeg", nrep=100)
   fit2 <- prr.test(eq2, data=otu.relative, var = "DietVegRandom", nrep=100) 
-  pvals.data.obs[taxa]  <- fit1$p.value.obs
-  pvals.null.obs[taxa]  <- fit2$p.value.obs
-  pvals.data.sim[taxa]  <- fit1$p.value.perm$p0
-  pvals.null.sim[taxa]  <- fit2$p.value.perm$p0
-}
+  c(loglik.diet=fit1$p.value.obs, llperm.diet=fit1$p.value.perm$p0[[1]], 
+    loglik.null=fit2$p.value.obs, llperm.null=fit2$p.value.perm$p0[[1]])
+})
 ```
 
 Likelihood:
 
 ```{r}
-df <- rbind(data.frame(experiment='p-values: diet in data set', p=pvals.data.obs, Variable="Diet"),
-            data.frame(experiment='p-values: null hypothesis', p=pvals.null.obs, Variable="Random Diet"))
+df <- rbind(data.frame(experiment='p-values: diet in data set', p=results$loglik.diet, Variable="Diet"),
+            data.frame(experiment='p-values: null hypothesis', p=results$loglik.null, Variable="Random Diet"))
 ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, breaks = seq(0,1,0.1)) + facet_wrap(~experiment) +
   ggtitle("Likelihood: Histogram of p-values")
 ```
 PRR test:
 
 ```{r}
-df <- rbind(data.frame(experiment='p-values: diet in data set', p=pvals.data.sim, Variable="Diet"),
-            data.frame(experiment='p-values: null hypothesis', p=pvals.null.sim, Variable="Random Diet"))
+df <- rbind(data.frame(experiment='p-values: diet in data set', p=results$llperm.diet, Variable="Diet"),
+            data.frame(experiment='p-values: null hypothesis', p=results$llperm.null, Variable="Random Diet"))
 ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, breaks = seq(0,1,0.1)) + facet_wrap(~experiment) +
   ggtitle("PRR test: Histogram of p-values")
 ```
 
 ## New PRR-test: Linear model on relative abundances (Diet)
 
-Apply the new glmperm implementation to the example OTU:
+Apply the new implementation to the example OTU:
 
 ```{r}
-prr.test.glm(ASV159 ~ Diet + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE,
-          data=otu.relative, test.var = "Diet", n.rep=1000, family=gaussian())
+prr.test.glm(ASV159 ~ Diet + AgeCat + UrbanizationCat, data=otu.relative, test.var = "Diet", n.rep=1000, family=gaussian())
 ```
 
-Apply the new glmperm implementation all OTUs, saving the likelihood and PRR test based p-values for Diet and DietRandom:
+Apply the new implementation all OTUs, saving the likelihood and PRR test based p-values for Diet and DietRandom:
 
 ```{r, message=FALSE, warning=FALSE}
-pvals.data.obs  <- c()
-pvals.null.obs  <- c()
-pvals.data.sim  <- c()
-pvals.null.sim  <- c()
-for(taxa in otu.names) {
-  #print(taxa)
-  eq1 <- as.formula(sprintf("%s ~ Diet + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE", taxa))
-  eq2 <- as.formula(sprintf("%s ~ DietRandom + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE", taxa))
+results <- as.data.frame(foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+  taxa = otu.names[[i]]
+  eq1 <- as.formula(sprintf("%s ~ Diet + AgeCat + UrbanizationCat ", taxa))
+  eq2 <- as.formula(sprintf("%s ~ DietRandom + AgeCat + UrbanizationCat ", taxa))
   fit1 <- prr.test.glm(eq1, data=otu.relative, test.var = "Diet", n.rep=100, family=gaussian())
   fit2 <- prr.test.glm(eq2, data=otu.relative, test.var = "DietRandom", n.rep=100, family=gaussian()) 
-  pvals.data.obs[taxa]  <- fit1$p.value.obs
-  pvals.null.obs[taxa]  <- fit2$p.value.obs
-  pvals.data.sim[taxa]  <- fit1$p.value.sim
-  pvals.null.sim[taxa]  <- fit2$p.value.sim
-}
+  c(loglik.diet=fit1$p.value.obs, llperm.diet=fit1$p.value.sim, 
+    loglik.null=fit2$p.value.obs, llperm.null=fit2$p.value.sim)
+})
 ```
 
 Likelihood:
 
 ```{r}
-df <- rbind(data.frame(experiment='p-values: diet in data set', p=pvals.data.obs, Variable="Diet"),
-            data.frame(experiment='p-values: null hypothesis', p=pvals.null.obs, Variable="Random Diet"))
+df <- rbind(data.frame(experiment='p-values: diet in data set', p=results$loglik.diet, Variable="Diet"),
+            data.frame(experiment='p-values: null hypothesis', p=results$loglik.null, Variable="Random Diet"))
 ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, breaks = seq(0,1,0.1)) + facet_wrap(~experiment) +
   ggtitle("Likelihood: Histogram of p-values")
 ```
-
 PRR test:
 
 ```{r}
-df <- rbind(data.frame(experiment='p-values: diet in data set', p=pvals.data.sim, Variable="Diet"),
-            data.frame(experiment='p-values: null hypothesis', p=pvals.null.sim, Variable="Random Diet"))
+df <- rbind(data.frame(experiment='p-values: diet in data set', p=results$llperm.diet, Variable="Diet"),
+            data.frame(experiment='p-values: null hypothesis', p=results$llperm.null, Variable="Random Diet"))
 ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, breaks = seq(0,1,0.1)) + facet_wrap(~experiment) +
   ggtitle("PRR test: Histogram of p-values")
 ```
 
 ## New PRR-test: Poisson model on counts (Diet)
 
-Apply the new glmperm implementation to the example OTU:
+Apply the new implementation to the example OTU:
 
 ```{r}
-prr.test.glm(ASV159 ~ Diet + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE + offset(log(library_size)),
-          data=otu.counts, test.var = "Diet", n.rep=1000, family=poisson())
+prr.test.glm(ASV159 ~ Diet + AgeCat + UrbanizationCat + offset(log(library_size)), 
+             data=otu.counts, test.var = "Diet", n.rep=1000, family=poisson())
 ```
 
-Apply the new glmperm implementation all OTUs, saving the likelihood and PRR test based p-values for Diet and DietRandom:
+Apply the new implementation all OTUs, saving the likelihood and PRR test based p-values for Diet and DietRandom:
 
 ```{r, message=FALSE, warning=FALSE}
-set.seed(42)
-
-pvals.data.obs  <- c()
-pvals.null.obs  <- c()
-pvals.data.sim  <- c()
-pvals.null.sim  <- c()
-for(taxa in otu.names) {
-  #print(taxa)
-  eq1 <- as.formula(sprintf("%s ~ Diet + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE + offset(log(library_size))", taxa))
-  eq2 <- as.formula(sprintf("%s ~ DietRandom + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE + offset(log(library_size))", taxa))
+results <- as.data.frame(foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+  taxa = otu.names[[i]]
+  eq1 <- as.formula(sprintf("%s ~ Diet + AgeCat + UrbanizationCat + offset(log(library_size))", taxa))
+  eq2 <- as.formula(sprintf("%s ~ DietRandom + AgeCat + UrbanizationCat + offset(log(library_size))", taxa))
   fit1 <- prr.test.glm(eq1, data=otu.counts, test.var = "Diet", n.rep=100, family=poisson())
   fit2 <- prr.test.glm(eq2, data=otu.counts, test.var = "DietRandom", n.rep=100, family=poisson()) 
-  pvals.data.obs[taxa]  <- fit1$p.value.obs
-  pvals.null.obs[taxa]  <- fit2$p.value.obs
-  pvals.data.sim[taxa]  <- fit1$p.value.sim
-  pvals.null.sim[taxa]  <- fit2$p.value.sim
-}
+  c(loglik.diet=fit1$p.value.obs, llperm.diet=fit1$p.value.sim, 
+    loglik.null=fit2$p.value.obs, llperm.null=fit2$p.value.sim)
+})
 ```
 
 Likelihood:
 
 ```{r}
-df <- rbind(data.frame(experiment='p-values: diet in data set', p=pvals.data.obs, Variable="Diet"),
-            data.frame(experiment='p-values: null hypothesis', p=pvals.null.obs, Variable="Random Diet"))
+df <- rbind(data.frame(experiment='p-values: diet in data set', p=results$loglik.diet, Variable="Diet"),
+            data.frame(experiment='p-values: null hypothesis', p=results$loglik.null, Variable="Random Diet"))
 ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, breaks = seq(0,1,0.1)) + facet_wrap(~experiment) +
   ggtitle("Likelihood: Histogram of p-values")
 ```
-
 PRR test:
 
 ```{r}
-df <- rbind(data.frame(experiment='p-values: diet in data set', p=pvals.data.sim, Variable="Diet"),
-            data.frame(experiment='p-values: null hypothesis', p=pvals.null.sim, Variable="Random Diet"))
+df <- rbind(data.frame(experiment='p-values: diet in data set', p=results$llperm.diet, Variable="Diet"),
+            data.frame(experiment='p-values: null hypothesis', p=results$llperm.null, Variable="Random Diet"))
 ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, breaks = seq(0,1,0.1)) + facet_wrap(~experiment) +
   ggtitle("PRR test: Histogram of p-values")
 ```
@@ -263,37 +222,30 @@ ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, 
 This is a standard negative binomial model:
 
 ```{r, message=FALSE, warning=FALSE}
-formula = ASV159 ~ Diet + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE + offset(log(library_size))
-fit <- prr.test.ll(formula, otu.counts, test.var="Diet", n.rep=1000, family=NegativeBinomial())
+fit <- prr.test.ll(ASV159 ~ Diet + AgeCat + UrbanizationCat + offset(log(library_size)), 
+                   otu.counts, test.var="Diet", n.rep=1000, family=NegativeBinomial())
 fit[c("p.value.obs", "p.value.sim")]
 ```
 
-Apply the new glmperm implementation to first 100 OTUs, saving the likelihood and PRR test based p-values for Diet and DietRandom:
+Apply the new implementation to all OTUs, saving the likelihood and PRR test based p-values for Diet and DietRandom:
 
 ```{r, message=FALSE, warning=FALSE}
-set.seed(42)
-
-pvals.data.obs  <- c()
-pvals.null.obs  <- c()
-pvals.data.sim  <- c()
-pvals.null.sim  <- c()
-for(taxa in otu.names[1:100]) {
-  eq1 <- as.formula(sprintf("%s ~ Diet + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE + offset(log(library_size))", taxa))
-  eq2 <- as.formula(sprintf("%s ~ DietRandom + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE + offset(log(library_size)) ", taxa))
+results <- as.data.frame(foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+  taxa = otu.names[[i]]
+  eq1 <- as.formula(sprintf("%s ~ Diet + AgeCat + UrbanizationCat + offset(log(library_size))", taxa))
+  eq2 <- as.formula(sprintf("%s ~ DietRandom + AgeCat + UrbanizationCat + offset(log(library_size)) ", taxa))
   fit1 <- prr.test.ll(eq1, otu.counts, test.var = "Diet", test="both", n.rep=100, family=NegativeBinomial())
   fit2 <- prr.test.ll(eq2, otu.counts, test.var = "DietRandom", test="both", n.rep=100, family=NegativeBinomial()) 
-  pvals.data.obs[taxa]  <- fit1$p.value.obs
-  pvals.null.obs[taxa]  <- fit2$p.value.obs
-  pvals.data.sim[taxa]  <- fit1$p.value.sim
-  pvals.null.sim[taxa]  <- fit2$p.value.sim
-}
+  c(loglik.diet=fit1$p.value.obs, llperm.diet=fit1$p.value.sim, 
+    loglik.null=fit2$p.value.obs, llperm.null=fit2$p.value.sim)
+})
 ```
 
 Likelihood:
 
 ```{r}
-df <- rbind(data.frame(experiment='p-values: diet in data set', p=pvals.data.obs, Variable="Diet"),
-            data.frame(experiment='p-values: null hypothesis', p=pvals.null.obs, Variable="Random Diet"))
+df <- rbind(data.frame(experiment='p-values: diet in data set', p=results$loglik.diet, Variable="Diet"),
+            data.frame(experiment='p-values: null hypothesis', p=results$loglik.null, Variable="Random Diet"))
 ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, breaks = seq(0,1,0.1)) + facet_wrap(~experiment) +
   ggtitle("Likelihood: Histogram of p-values")
 ```
@@ -301,19 +253,24 @@ ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, 
 PRR test:
 
 ```{r}
-df <- rbind(data.frame(experiment='p-values: diet in data set', p=pvals.data.sim, Variable="Diet"),
-            data.frame(experiment='p-values: null hypothesis', p=pvals.null.sim, Variable="Random Diet"))
+df <- rbind(data.frame(experiment='p-values: diet in data set', p=results$llperm.diet, Variable="Diet"),
+            data.frame(experiment='p-values: null hypothesis', p=results$llperm.null, Variable="Random Diet"))
 ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, breaks = seq(0,1,0.1)) + facet_wrap(~experiment) +
   ggtitle("PRR test: Histogram of p-values")
 ```
 
 ### Zero-inflated Negative Binomial
 
+The zero-inflated negative binomial often provides a better fit. We define a model specification for both 'count' and 'zero' components:
 
-The zero-inflated negative binomial often provides a better fit. This tests 'both' count and zero components for association with diet:
+```{r}
+formula = ASV159 ~ Diet + AgeCat + UrbanizationCat + offset(log(library_size)) | Diet + AgeCat + offset(log(library_size))
+```
+
+
+This tests both 'count' and 'zero' components for association with diet:
 
 ```{r, message=FALSE, warning=FALSE}
-formula = ASV159 ~ Diet + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE + offset(log(library_size)) | Diet + Age + offset(log(library_size))
 fit <- prr.test.ll(formula, otu.counts, test.var="Diet", n.rep=1000, test="both", family=ZINegativeBinomial())
 fit[c("p.value.obs", "p.value.sim")]
 ```
@@ -321,7 +278,6 @@ fit[c("p.value.obs", "p.value.sim")]
 we can also test just the 'count' component:
 
 ```{r}
-formula = ASV159 ~ Diet + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE + offset(log(library_size)) | Diet + Age + offset(log(library_size))
 fit <- prr.test.ll(formula, otu.counts, test.var="Diet", test="count", n.rep=1000, family=ZINegativeBinomial())
 fit[c("p.value.obs", "p.value.sim")]
 ```
@@ -329,38 +285,29 @@ fit[c("p.value.obs", "p.value.sim")]
 ... or just the 'zero' component:
 
 ```{r}
-formula = ASV159 ~ Diet + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE + offset(log(library_size)) | Diet + Age + offset(log(library_size))
 fit <- prr.test.ll(formula, otu.counts, test.var="Diet", test="zero", n.rep=1000, family=ZINegativeBinomial())
 fit[c("p.value.obs", "p.value.sim")]
 ```
 
-
-Apply the new glmperm implementation to first 100 OTUs, saving the likelihood and PRR test based p-values for Diet and DietRandom:
+Apply the new implementation to all OTUs, saving the likelihood and PRR test based p-values for Diet and DietRandom:
 
 ```{r, message=FALSE, warning=FALSE}
-set.seed(42)
-
-pvals.data.obs  <- c()
-pvals.null.obs  <- c()
-pvals.data.sim  <- c()
-pvals.null.sim  <- c()
-for(taxa in otu.names[1:100]) {
-  eq1 <- as.formula(sprintf("%s ~ Diet + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE + offset(log(library_size)) | Diet + Age + offset(log(library_size)) ", taxa))
-  eq2 <- as.formula(sprintf("%s ~ DietRandom + Age + UrbanizationLevel + Gender + Education + PetAnimals + TravelToSE + offset(log(library_size)) | DietRandom + Age + offset(log(library_size)) ", taxa))
+results <- as.data.frame(foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+  taxa = otu.names[[i]]
+  eq1 <- as.formula(sprintf("%s ~ Diet + AgeCat + UrbanizationCat + offset(log(library_size)) | Diet + AgeCat + offset(log(library_size)) ", taxa))
+  eq2 <- as.formula(sprintf("%s ~ DietRandom + AgeCat + UrbanizationCat + offset(log(library_size)) | DietRandom + AgeCat + offset(log(library_size)) ", taxa))
   fit1 <- prr.test.ll(eq1, otu.counts, test.var = "Diet", test="both", n.rep=100, family=ZINegativeBinomial())
   fit2 <- prr.test.ll(eq2, otu.counts, test.var = "DietRandom", test="both", n.rep=100, family=ZINegativeBinomial()) 
-  pvals.data.obs[taxa]  <- fit1$p.value.obs
-  pvals.null.obs[taxa]  <- fit2$p.value.obs
-  pvals.data.sim[taxa]  <- fit1$p.value.sim
-  pvals.null.sim[taxa]  <- fit2$p.value.sim
-}
+  c(loglik.diet=fit1$p.value.obs, llperm.diet=fit1$p.value.sim, 
+    loglik.null=fit2$p.value.obs, llperm.null=fit2$p.value.sim)
+})
 ```
 
 Likelihood:
 
 ```{r}
-df <- rbind(data.frame(experiment='p-values: diet in data set', p=pvals.data.obs, Variable="Diet"),
-            data.frame(experiment='p-values: null hypothesis', p=pvals.null.obs, Variable="Random Diet"))
+df <- rbind(data.frame(experiment='p-values: diet in data set', p=results$loglik.diet, Variable="Diet"),
+            data.frame(experiment='p-values: null hypothesis', p=results$loglik.null, Variable="Random Diet"))
 ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, breaks = seq(0,1,0.1)) + facet_wrap(~experiment) +
   ggtitle("Likelihood: Histogram of p-values")
 ```
@@ -368,8 +315,8 @@ ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, 
 PRR test:
 
 ```{r}
-df <- rbind(data.frame(experiment='p-values: diet in data set', p=pvals.data.sim, Variable="Diet"),
-            data.frame(experiment='p-values: null hypothesis', p=pvals.null.sim, Variable="Random Diet"))
+df <- rbind(data.frame(experiment='p-values: diet in data set', p=results$llperm.diet, Variable="Diet"),
+            data.frame(experiment='p-values: null hypothesis', p=results$llperm.null, Variable="Random Diet"))
 ggplot(df, aes(x=p, color=Variable, fill=Variable)) + geom_histogram(alpha=0.6, breaks = seq(0,1,0.1)) + facet_wrap(~experiment) +
   ggtitle("PRR test: Histogram of p-values")
 ```
@@ -381,7 +328,7 @@ Test the part of the function that splits the data into two model matrices, xyz=
 2) Z: the zero-inflation model matrix (after '|' in formula)
 
 ```{r}
-formula = ASV159 ~ Diet + Age + UrbanizationLevel + Gender + offset(log(library_size)) | Diet + Age + offset(log(library_size)) 
+formula = ASV159 ~ Diet + AgeCat + UrbanizationCat + offset(log(library_size)) | Diet + AgeCat + offset(log(library_size)) 
 data   <- prr.test.ll(formula, otu.counts, test.var="Diet", xyz=TRUE)
 data$Y2 <- with(otu.counts, cbind(ASV159, library_size - ASV159))
 str(data)
@@ -398,4 +345,10 @@ for (model in c("Poisson", "ZIPoisson", "Binomial", "ZIBinomial", "NegativeBinom
   print(model)
   print(fit$loglik)
 }
+```
+
+## Finally
+
+```{r}
+stopImplicitCluster()
 ```

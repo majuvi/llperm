@@ -1,3 +1,9 @@
+#' Poisson family
+#'
+#' This is part of the new implementation.
+#'
+#' @param count.link link function for the count component
+#' @export
 Poisson <- function(count.link="log") {
 	count.link <- make.link(count.link)
 	list(

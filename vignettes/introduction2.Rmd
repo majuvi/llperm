@@ -1,0 +1,350 @@
+---
+title: "introduction"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{introduction}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+# Preliminaries
+
+Load the required libraries.
+
+```{r, imports, message=FALSE, warning=FALSE}
+library(llperm)
+library(coin)
+library(ggplot2)
+library(MASS)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(gridExtra)
+```
+
+Use parallel processing (optional).
+
+```{r}
+library(foreach)
+library(doParallel)
+numCores <- 16 #detectCores()
+registerDoParallel(numCores)
+```
+
+
+## Load the data set
+
+Load the data set. We have two data frames: OTU table and person metadata.
+
+```{r, load_data}
+fn.sequence <- system.file("extdata", "VEGA_sequences.txt", package = "llperm")
+fn.metadata <- system.file("extdata", "VEGA_metadata.txt", package = "llperm")
+
+otu.table    <- read.table(fn.sequence, sep="\t", header=T, row.names=1)
+otu.metadata <- read.table(fn.metadata, sep="\t", header=T, row.names=1, stringsAsFactors=T)
+```
+
+These are all the taxa:
+
+```{r}
+otu.names <- colnames(otu.table)
+```
+
+This is a data frame of abundances as raw counts
+
+```{r}
+otu.counts <- cbind(otu.table, otu.metadata)
+otu.counts$DietRandom <- otu.counts$Diet[sample(1:nrow(otu.counts))] 
+otu.counts$Sample <- rownames(otu.counts)
+otu.counts$library_size <- rowSums(otu.table)
+```
+
+
+## Real data statistics
+
+Calculate mean and variance:
+
+```{r}
+# Long form OTU table
+otu.reads <- otu.counts %>% 
+  select(all_of(otu.names)) %>% 
+  pivot_longer(cols=c(everything()), names_to="OTU", values_to="Reads")
+# Fit Negative Binomial to read counts
+fit <- glm.nb(Reads ~ 1, data=otu.reads)
+alpha = fit$coefficients[["(Intercept)"]]
+theta = fit$theta
+# Add implied Negative Binomial variance
+stats <- otu.reads %>% 
+  group_by(OTU) %>% 
+  summarise(Mean = mean(Reads), Variance = var(Reads)) %>% 
+  mutate(NB = Mean + Mean^2/theta)
+
+```
+
+Library size varies and data has significant overdispersion:
+
+```{r}
+df <- gather(stats, key = Type, value = Variance, c("Variance", "NB"))
+
+# Library size looks like slightly skewed log-normal
+p1 <- ggplot(otu.counts, aes(x=library_size)) + geom_histogram(bins=30) + scale_x_continuous(trans='log10')
+# Compare mean and variance, highly overdispersed
+colors = c("Poisson"="grey", "NegBin"="blue", "Data"="black")
+p2 <- ggplot(stats, aes(x = Mean)) + 
+  geom_point(aes(y = Variance, color="Data")) + 
+  geom_line(aes(y = NB, color="NegBin")) + 
+  geom_abline(aes(intercept = 0, slope = 1, color="Poisson")) + 
+  labs(x = "Mean", y = "Variance", color = "Legend") + scale_color_manual(values = colors) +
+  scale_x_log10(labels = scales::scientific) + scale_y_log10(labels = scales::scientific) + 
+  theme(legend.position="top")
+grid.arrange(p1, p2, ncol=2)
+```
+
+## Functions to simulate from Zero-Inflated Negative Binomial
+
+```{r}
+library(pscl)
+
+# Given a data frame of OTU counts and columns, calculate zero-inflated negative binomial parameters
+zinb_parameters <- function(otu.counts, otu.names) {
+  parameters <- list()
+  for (otu in otu.names) {
+    if (all(otu.counts[[otu]] > 0)) {
+      fit <- glm.nb(get(otu) ~ 1, data=otu.counts)
+      alpha = fit$coefficients[["(Intercept)"]]
+      beta = NA
+      theta = fit$theta
+    } else {
+      fit <- zeroinfl(get(otu) ~ 1 | 1, data = otu.counts, dist = "negbin", EM = F)
+      alpha = fit$coefficients$count[["(Intercept)"]]
+      beta = fit$coefficients$zero[["(Intercept)"]]
+      theta = fit$theta
+    }
+    parameters[[otu]] <- c(alpha=alpha, beta=beta, theta=theta)
+  }
+  parameters <- data.frame(parameters)
+  return(parameters)
+}
+```
+
+
+```{r}
+# Generate simulated signal from strata defined by a combination of features, 
+# each feature value makes 10% of OTUs independently differentially abundant
+generate_signal <- function (strata, sample.size, otu.names, effect=log(2)) {
+  # Randomly sample a data frame of features from a given strata definition
+  idx <- sample(1:nrow(strata), sample.size, replace=T, prob=strata$Probability)
+  df.features <- strata[idx,]
+  features <- colnames(strata)[colnames(strata) != "Probability"]
+  # Loop over different features that define a strata
+  diff.abundant <- list()
+  for (feature in features) {
+    # For every feature value, randomly sample 10% of OTUs differentially abundant
+    diff.abundant.value <- list()
+    values <- unique(df.features[[feature]])
+    for (value in values){
+      diff.abundant.value[[value]] <- sample(otu.names, length(otu.names)/10)
+    }
+    diff.abundant[[feature]] <- diff.abundant.value
+  }
+  # Define effects X
+  X <- array(0, c(sample.size,length(otu.names)), list(1:sample.size, otu.names))
+  # Loop over every person and define their OTU effect  
+  for (i in 1:sample.size) {
+    person <- df.features[i,]
+    for (feature in names(diff.abundant)) {
+      otus <- diff.abundant[[feature]][[person[[feature]]]]
+      X[i, otus] = X[i, otus] + effect
+    }
+  }
+  # These OTUs are truly differentially abundant (affected by Group)
+  diff.abundant <- unique(unlist(diff.abundant$Group))
+  return(list(df.effects=X, df.features=df.features, diff.abundant=diff.abundant))
+}
+```
+
+```{r}
+# Given zero-inflated negative binomial parameters and sample size, create a simulated data set
+zinb_simulate <- function(parameters, sample.size, strata=NULL, effect=log(2)) {
+  otu.names <- colnames(parameters)
+  # Whether there is strata that defines any signal, i.e. differentially abundant OTUs
+  if (!is.null(strata))
+      signal <- generate_signal(strata, sample.size, otu.names, effect)
+  # Generate OTU counts
+  otu.simulated <- list()
+  for (otu in otu.names) {
+    params <- parameters[[otu]]
+    alpha <- params[1]
+    beta <- params[2]
+    theta <- params[3]
+    otu.effect = if (!is.null(strata)) signal$df.effects[,otu] else 0 # This is the 'signal'
+    is.zero = if (!is.na(beta)) rbinom(sample.size, size=1, prob=1/(1+exp(-beta + otu.effect))) else rep(0,sample.size)
+    count.nonzero = rnbinom(sample.size, size=theta, mu=exp(alpha + otu.effect))
+    otu.simulated[[otu]] = ifelse(is.zero, 0, count.nonzero)
+  }
+  otu.simulated <- data.frame(otu.simulated)
+  # Add features if relevant
+  if (!is.null(strata)) {
+    otu.simulated$library_size <- rowSums(otu.simulated)
+    otu.simulated <- data.frame(otu.simulated, signal$df.features)
+  }
+  return(list(X=otu.simulated, 
+              y=if (!is.null(strata)) signal$diff.abundant else NULL))
+}
+```
+
+```{r}
+# Simple statistics calculation
+simple_stats <- function(labels, scores, threshold=0.05, decreasing=FALSE){
+  labels <- labels[order(scores, decreasing=decreasing)]
+  scores <- scores[order(scores, decreasing=decreasing)]
+  # Calculate AUC
+  AUC <- 1 - sum(labels * cumsum(!labels)) / (sum(!labels) * sum(labels))
+  # Calculate Power at a given False Discovery Rate (FDR)
+  TPR <- cumsum(labels)/sum(labels)
+  FPR <- cumsum(!labels)/sum(!labels)
+  PowerAt <- TPR[which.min(abs(FPR - threshold))]
+  # Calculate Power = TP/P and FDR = FP/N
+  labels_pred <- if (decreasing) scores > threshold else scores <= threshold
+  Power   <- sum(labels_pred & labels)/sum(labels)
+  FPR     <- sum(labels_pred & !labels)/sum(!labels)
+  results <- data.frame(AUC=AUC, PowerAt=PowerAt, Power=Power, FPR=FPR)
+  return(results)
+}
+```
+
+# Compare real data and simulated data
+
+This is the distribution of real data for 9 example taxa:
+
+```{r}
+# Plot non-zero counts and proportion of non-zero counts for 9 example taxa
+otu.example <- sample(otu.names, 9)
+p1 <- ggplot(otu.reads %>% filter(OTU %in% otu.example), aes(x=Reads, color=OTU, fill=OTU)) +
+  geom_histogram(bins=30) + facet_wrap(~OTU) + scale_x_continuous(trans='log10') + 
+  theme(legend.position="top", legend.text = element_text(size=6), legend.title = element_blank())
+p2 <- ggplot(otu.reads %>% filter(OTU %in% otu.example) %>% mutate(Nonzero = Reads > 0), aes(x=Nonzero, color=OTU, fill=OTU)) +
+  geom_bar(stat="count") + facet_wrap(~OTU) + theme(legend.position="top", legend.text = element_text(size=6), legend.title = element_blank())
+grid.arrange(p1, p2, ncol=2)
+```
+
+Fit zero-inflated Negative Binomial to the example OTUs:
+
+```{r}
+parameters <- zinb_parameters(otu.counts, otu.example)
+```
+
+Simulate data from these parameters:
+
+```{r}
+otu.simulated <- zinb_simulate(parameters, sample.size=nrow(otu.counts))$X
+```
+
+Visualize, looks pretty good:
+
+```{r}
+otu.simulated.reads <- otu.simulated %>% pivot_longer(cols=everything(), names_to="OTU", values_to="Reads")
+
+p1 <- ggplot(otu.simulated.reads, aes(x=Reads, color=OTU, fill=OTU)) +
+  geom_histogram(bins=30) + facet_wrap(~OTU) + scale_x_continuous(trans='log10') + 
+  theme(legend.position="top", legend.text = element_text(size=6), legend.title = element_blank())
+p2 <- ggplot(otu.simulated.reads %>% mutate(Nonzero = Reads > 0), aes(x=Nonzero, color=OTU, fill=OTU)) +
+  geom_bar(stat="count") + facet_wrap(~OTU) + theme(legend.position="top", legend.text = element_text(size=6), legend.title = element_blank())
+grid.arrange(p1, p2, ncol=2)
+```
+
+
+## Simulate data from ZINB
+
+Find distribution parameters by fitting it to each taxa in real data
+
+```{r}
+# Fit ZIBN to real data
+parameters <- zinb_parameters(otu.counts, otu.names)
+```
+
+Generate the 'signal' by defining artificial covariates and sampling from the distribution:
+
+```{r}
+# Specify a bivariate distribution
+strata <- data.frame(Group = rep(c("meateater", "fisheater", "vegetarian", "vegan"), 2), 
+                     Covariate=c(rep("urbanlow", 4), rep("urbanhigh", 4)),
+                     Probability=c(0.20, 0.15, 0.10, 0.05, 0.05, 0.10, 0.15, 0.20))
+# Create simulated data
+data <- zinb_simulate(parameters, sample.size=nrow(otu.counts), strata=strata, effect=log(2))
+otu.simulated <- data$X
+otu.true <- data.frame(otu=otu.names, y_true=otu.names %in% data$y %>% as.integer)
+```
+
+Define models to fit
+
+```{r}
+models <- list(
+  "Poisson"    = "%s ~ Group + Covariate + offset(log(library_size))",
+  "Binomial"   = "cbind(%s, library_size - %s) ~ Group + Covariate ",
+  "NegativeBinomial"     = "%s ~ Group + Covariate  + offset(log(library_size))",
+  "BetaBinomial"    = "cbind(%s, library_size - %s) ~ Group + Covariate ", 
+  "ZIPoisson"  = "%s ~ Group + Covariate + offset(log(library_size)) | Group + Covariate + offset(log(library_size))",
+  "ZIBinomial" = "cbind(%s, library_size - %s) ~ Group + Covariate | Group + Covariate",
+  "ZINegativeBinomial"   = "%s ~ Group + Covariate + offset(log(library_size)) | Group + Covariate + offset(log(library_size))",
+  "ZIBetaBinomial"  = "cbind(%s, library_size - %s) ~ Group + Covariate | Group + Covariate"
+)
+```
+
+Loop over models, calculating the log-likelihood based p-value and PRR-test based p-value
+
+```{r}
+# Loop over models
+results <- list()
+for (model in names(models)) {
+  print(model)
+  start <- Sys.time()
+  str.model <- models[[model]]
+  family <- get(model, mode = "function", envir = parent.frame())
+  
+  # Loop over OTUs in paraller
+  results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+    otu <- otu.names[[i]]
+    eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+    fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=500, family=family)
+    c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim)
+  }
+  # Save p-values from both log likelihood and prr-test
+  results.model <- as.data.frame(results.model) %>% 
+    mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+    inner_join(otu.true, by="otu") %>% 
+    pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+    mutate(y_pred = p_value <= 0.05)
+  
+  results[[model]] <- results.model
+  # Time per model
+  end <- Sys.time()
+  print(end-start)
+}
+results <- bind_rows(results, .id = "family") 
+```
+Display statistics of each model:
+
+```{r}
+# Calculate statistics for each experiment and display the mean
+stats <- results %>% 
+  group_by(family, type) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value))
+print.data.frame(stats)
+```
+
+
+## Finally
+
+```{r}
+stopImplicitCluster()
+```

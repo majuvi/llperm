@@ -1,3 +1,9 @@
+#' Beta Binomial family
+#'
+#' This is part of the new implementation.
+#'
+#' @param count.link link function for the count component
+#' @export
 BetaBinomial <- function(count.link="logit") {
 	count.link <- make.link(count.link)
 	llbbinom <- function(y, y.c, a, b) lchoose(y.c, y) +  lbeta(y + a, y.c - y + b) - lbeta(a, b)
@@ -18,7 +24,7 @@ BetaBinomial <- function(count.link="logit") {
 			  loglik <- sum(llbbinom(y, y.c, a, b) * weights)
 			  return(loglik)
 			},
-		# Gradient
+		#Gradient
 		gradfun = function(parms, X, Y, Z=NULL, offsetx=0, offsetz=NULL, weights=1) {
 			  y <- as.vector(Y[,1])
 			  y.c <- as.vector(rowSums(Y))

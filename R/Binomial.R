@@ -1,3 +1,9 @@
+#' Binomial family
+#'
+#' This is part of the new implementation.
+#'
+#' @param count.link link function for the count component
+#' @export
 Binomial <- function(count.link="logit") {
 	count.link <- make.link(count.link)
 	list(

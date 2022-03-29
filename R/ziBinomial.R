@@ -1,3 +1,10 @@
+#' Zero-Inflated Binomial family
+#'
+#' This is part of the new implementation.
+#'
+#' @param count.link link function for the count component
+#' @param zero.link link function for the zero component
+#' @export
 ZIBinomial <- function(count.link="logit", zero.link="logit") {
 	count.link <- make.link(count.link)
 	zero.link <- make.link(zero.link)

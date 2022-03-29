@@ -1,3 +1,9 @@
+#' Negative Binomial family
+#'
+#' This is part of the new implementation.
+#'
+#' @param count.link link function for the count component
+#' @export
 NegativeBinomial <- function(count.link="log") {
 	count.link <- make.link(count.link)
 	list(

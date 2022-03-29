@@ -111,9 +111,6 @@ prr.test.ll <- function (formula, data, family=Poisson, subset, weights, na.acti
     offsetz <- NULL
   }
   
-  if (xyz) # return only the model matrix
-    return(list(X=X, Z=Z, Y=Y, offsetx=offsetx, offsetz=offsetz, weights=weights))
-
   X.cols.testvar = X.term.labels[X.term.columns] == test.var
   Z.cols.testvar = if (is.null(ffz)) NULL else Z.term.labels[Z.term.columns] == test.var
 
@@ -155,6 +152,9 @@ prr.test.ll <- function (formula, data, family=Poisson, subset, weights, na.acti
   } else {
     ZR <- Z0 <- Z
   }
+  
+  if (xyz) # return only the model matrix
+    return(list(X=X, Z=Z, Y=Y, XR=XR, X0=X0, ZR=ZR, Z0=Z0, offsetx=offsetx, offsetz=offsetz, weights=weights))
 
   # Calculate observed p-value
   fit.1 <- fitdist(XR, Y, ZR, offsetx, offsetz, weights, family=family, control=control)
@@ -178,6 +178,6 @@ prr.test.ll <- function (formula, data, family=Poisson, subset, weights, na.acti
   p.value.sim   <- mean(ll.1 < ll.r)
 
   results <- list(fit=fit.1, p.value.obs=p.value.obs, p.value.sim=p.value.sim)
-
+  class(results) <- "prr.test.ll"
   return(results)
 }

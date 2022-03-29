@@ -1,0 +1,1059 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, rows.print=25)
+```
+
+# Preliminaries
+
+Load the required libraries.
+
+```{r, imports, message=FALSE, warning=FALSE}
+library(coin)
+library(llperm)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(RColorBrewer)
+```
+
+Use parallel processing (optional).
+
+```{r}
+library(foreach)
+library(doParallel)
+numCores <- 16 #detectCores()
+registerDoParallel(numCores)
+```
+
+```{r}
+# Data sets:
+#    - Data: Real / Simulated (ZINB, ZIBB, log.reg + log-linear ls)
+#    - Variables: Diet group, Diet group + confounding variables
+#    - Diet group signal: Counts / Zeros / Both
+#    - Confounding non-signal: library size, counts variance
+#    - Setting: Sample size, Effect size, (Overdispersion)
+#
+#  Distributions
+
+# Poisson family  ----------- overdispersion ------------> 
+#  | zeros        Poisson                     Negative Binomial    
+# \_/             Zero-Inflated Poisson       Zero-Inflated Negative Binomial 
+#
+# Binomial family ----------- overdispersion ------------> 
+#  | zeros        Binomial                    Beta Binomial       
+# \_/             Zero-Inflated Binomial      Zero-Inflated Beta Binomial
+#
+
+```
+
+## Functions
+
+Define two functions to generate a simulated data set based on a real data set:
+
+```{r}
+# Generate simulated signal from strata defined by a combination of features, 
+#   each feature value makes given OTUs independently differentially abundant
+generate_signal <- function (strata, sample.size, otu.names, diff.abundant, effects) {
+  # Randomly sample a data frame of features from a given strata definition
+  idx <- sample(1:nrow(strata), sample.size, replace=T, prob=strata$Probability)
+  df.features <- strata[idx,]
+  # Define effects X
+  X <- array(1, c(sample.size,length(otu.names)), list(1:sample.size, otu.names))
+  # Loop over every person and define their OTU effect  
+  for (i in 1:sample.size) {
+    person <- df.features[i,]
+    for (feature in names(diff.abundant)) {
+      otus <- diff.abundant[[feature]][[person[[feature]]]]
+      X[i, otus] = X[i, otus] * effects[[feature]][[person[[feature]]]]
+    }
+  }
+  # These OTUs are truly differentially abundant (affected by Group)
+  diff.abundant <- unique(unlist(diff.abundant$Group))
+  return(list(df.effects=X, df.features=df.features, diff.abundant=diff.abundant))
+}
+
+# Given a real data set of OTU counts, simulate signal in the data set by multiplying counts
+data_simulate <- function(otu.counts, otu.names, strata=NULL, signal, which="both") {
+  # These are the real data OTU counts
+  otu.simulated <- otu.counts[,otu.names]
+  # Add signal and features if relevant
+  if (!is.null(strata)) {
+    if (which != "count") {
+      for (i in 1:ncol(otu.simulated)) {
+        otu.n <- otu.simulated[,i]
+        otu.n.nonzero <- otu.n[otu.n > 0]
+        odds <- sum(otu.n > 0) / sum(otu.n == 0) * signal$df.effects[,i]
+        non.zero <- sample(1:length(otu.n), size=length(otu.n.nonzero), replace=F, prob=1 / (1 + 1/odds))
+        otu.simulated[,i]         <- 0
+        otu.simulated[non.zero,i] <- otu.n.nonzero
+      }
+    }
+    if (which != "zero") 
+      otu.simulated <- round(otu.simulated * signal$df.effects)
+    otu.simulated$library_size <- rowSums(otu.simulated)
+    otu.simulated <- data.frame(otu.simulated, signal$df.features)
+  }
+  return(list(X=otu.simulated, 
+              y=if (!is.null(strata)) signal$diff.abundant else NULL))
+}
+
+```
+
+Calculating model metrics:
+
+```{r}
+# Simple ROC curve calculation
+simple_roc <- function(labels, scores){
+  labels <- labels[order(scores, decreasing=TRUE)]
+  data.frame(TPR=cumsum(labels)/sum(labels), FPR=cumsum(!labels)/sum(!labels), labels)
+}
+
+# Simple ROC curve calculation (with interpolation)
+simple_roc2 <- function(labels, scores, FPR.out=seq(0.00,1.00,0.01)){
+  labels <- labels[order(scores, decreasing=TRUE)]
+  temp <- data.frame(x=cumsum(labels)/sum(labels), 
+                     y=cumsum(!labels)/sum(!labels))
+  if (!is.null(FPR.out)) 
+    temp <- suppressWarnings(approx(temp$x, temp$y, xout=FPR.out, yleft=0, yright=1))
+  data.frame(TPR=temp$x, FPR=temp$y)
+}
+
+# Simple statistics calculation
+simple_stats <- function(labels, scores, threshold=0.05, decreasing=FALSE){
+  labels <- labels[order(scores, decreasing=decreasing)]
+  scores <- scores[order(scores, decreasing=decreasing)]
+  # Calculate AUC
+  AUC <- 1 - sum(labels * cumsum(!labels)) / (sum(!labels) * sum(labels))
+  # Calculate Power at a given False Discovery Rate (FDR)
+  TPR <- cumsum(labels)/sum(labels)
+  FPR <- cumsum(!labels)/sum(!labels)
+  PowerAt <- TPR[which.min(abs(FPR - threshold))]
+  # Calculate Power = TP/P and FDR = FP/N
+  labels_pred <- if (decreasing) scores > threshold else scores <= threshold
+  Power   <- sum(labels_pred & labels)/sum(labels)
+  FPR     <- sum(labels_pred & !labels)/sum(!labels)
+  results <- data.frame(AUC=AUC, PowerAt=PowerAt, Power=Power, FPR=FPR)
+  return(results)
+}
+```
+
+
+## Load the data set (llperm package)
+
+Load the data set. We have two data frames: OTU table and person metadata.
+
+```{r, load_data}
+fn.sequence <- system.file("extdata", "VEGA_sequences.txt", package = "llperm")
+fn.metadata <- system.file("extdata", "VEGA_metadata.txt", package = "llperm")
+otu.table    <- read.table(fn.sequence, sep="\t", header=T, row.names=1)
+otu.metadata <- read.table(fn.metadata, sep="\t", header=T, row.names=1, stringsAsFactors=T)
+```
+
+## Data frame: OTU counts
+
+Combine these to a single data frame
+
+```{r}
+otu.names <- colnames(otu.table)
+otu.counts <- cbind(otu.table, otu.metadata)
+otu.counts$Sample <- rownames(otu.counts)
+otu.counts$library_size <- rowSums(otu.table)
+```
+
+Visualize the 'ASV159' as an example taxa:
+
+```{r, warning=FALSE}
+p <- ggplot(otu.counts, aes(x=ASV305, color=Diet, fill=Diet)) + 
+  geom_histogram(bins=30) + facet_wrap(~Diet) + scale_x_continuous() + 
+  theme_bw() + theme(legend.position = "none")
+print(p)
+ggsave("example.png", height = 4 , width = 5, dpi=240)
+```
+Calculate mean and variance:
+
+```{r}
+with(otu.counts, print(sprintf("%.2f, %.2f", mean(ASV305), var(ASV305))))
+```
+
+# VEGA: Simulate from real data 
+
+```{r}
+set.seed(42)
+n.simulations <- 1 # simulate data and repeat the experiments n times to reduce sampling variance
+effects <- c(1.25, 1.5, 2.0, 3.0, 5.0) # multiply counts by effect, i.e. +25%, +50%, +100%, +200%, +400% 
+
+model.names <- c("Poisson", "ZIPoisson", "NegativeBinomial", "ZINegativeBinomial", 
+                 "Binomial", "ZIBinomial", "BetaBinomial", "ZIBetaBinomial")
+model.names <- with(expand.grid(c("loglik", "llperm"), model.names), paste0(sprintf("%s (%s)", Var2, Var1)))
+#test.names <- with(expand.grid(c("basic"), c("oneway_test", "kruskal_test")), 
+#                   paste0(sprintf("%s (%s)", Var2, Var1)))
+#model.names <- c(test.names, model.names)
+model.family <- setNames(c(rep("Poisson",8), rep("Binomial", 8)), model.names)
+```
+
+## Group comparison
+
+Specification of models:
+
+```{r}
+tests <- list(
+  "oneway_test"          = list(basic="%s ~ Group"),
+  "kruskal_test"         = list(basic="%s ~ Group")
+)
+
+models <- list(
+  "Poisson"    = "%s ~ Group + offset(log(library_size))",
+  "Binomial"   = "cbind(%s, library_size - %s) ~ Group ",
+  "NegativeBinomial"     = "%s ~ Group + offset(log(library_size))",
+  "BetaBinomial"    = "cbind(%s, library_size - %s) ~ Group ", 
+  "ZIPoisson"  = "%s ~ Group + offset(log(library_size)) | Group + offset(log(library_size))",
+  "ZIBinomial" = "cbind(%s, library_size - %s) ~ Group | Group ",
+  "ZINegativeBinomial"   = "%s ~ Group + offset(log(library_size)) | Group + offset(log(library_size))",
+  "ZIBetaBinomial"  = "cbind(%s, library_size - %s) ~ Group | Group "
+)
+
+```
+
+Specification of signal: 
+
+```{r}
+# Specify a simple categeorical distribution for each group
+strata <- data.frame(Group = c("meateater", "fisheater", "vegetarian", "vegan"), 
+                     Probability=c(0.25, 0.25, 0.25, 0.25))
+# These taxa are differentially abundant in each group
+diff.abundant <- list(
+  "Group" = list(
+    "meateater" = sample(otu.names, length(otu.names)/10),
+    "fisheater" = sample(otu.names, length(otu.names)/10),
+    "vegetarian" = sample(otu.names, length(otu.names)/10),
+    "vegan" = sample(otu.names, length(otu.names)/10)
+  )
+)
+```
+
+### Signal: counts
+
+Experiment:
+
+```{r}
+fn <- "results.csv"
+if (file.exists(fn))
+	file.remove(fn)
+
+# Loop over generated data sets 
+for (i in 1:n.simulations) {
+  print(sprintf("===== Experiment %d =====", i))
+
+  for (effect in effects) {
+    print(sprintf("*** Effect %.2f ***", effect))
+      
+    # Create simulated signal in real data
+    diff.effects <- list(
+      "Group" = list("meateater" = effect, "fisheater" = effect, "vegetarian" = effect, "vegan" = effect)
+    )
+    signal <- generate_signal(strata, sample.size=nrow(otu.counts), otu.names, diff.abundant, diff.effects)
+    data   <- data_simulate(otu.counts, otu.names, strata=strata, signal, which="count")
+    
+    # This is the data.frame of simulated data and true answers
+    otu.simulated <- data$X
+    otu.simulated$Group <- as.factor(otu.simulated$Group)
+    otu.true <- data.frame(otu=otu.names, y_true=as.integer(otu.names %in% data$y))
+      
+    # Loop over statistical tests
+    results.tests <- list()
+    for (test in names(tests)) {
+      print(test)
+      start <- Sys.time()
+      str.tests <- tests[[test]]
+      testf <- get(test, mode = "function", envir = parent.frame())
+      # Loop over OTUs in paraller
+      results.test <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        pval <- list()
+        for (test.name in names(str.tests)) {
+          str.test <- str.tests[[test.name]]
+          eq <- as.formula(do.call("sprintf", as.list(c(str.test, rep(otu, str_count(str.test, "%s"))))))
+          subset = NULL
+          if (test.name == "strata") {
+            n.in.strata <- table(otu.simulated$Strata)
+            subset = otu.simulated$Strata %in% names(n.in.strata[n.in.strata > 1])
+          }
+          fit <- testf(eq, data=otu.simulated, subset=subset, distribution=approximate(nresample=500))
+          pval[[test.name]] <- pvalue(fit)
+        }
+        otu.result <- c(otu=otu, unlist(pval))
+        otu.result
+      }
+      # Save p-values from different test types
+      results.test <- as.data.frame(results.test) %>% 
+        mutate(basic = basic %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(basic), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      results.tests[[test]] <- results.test
+      # Time per test
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.tests <- bind_rows(results.tests, .id = "family") 
+  
+    # Loop over models
+    results.models <- list()
+    for (model in names(models)) {
+      print(model)
+      start <- Sys.time()
+      str.model <- models[[model]]
+      family <- get(model, mode = "function", envir = parent.frame())
+      
+      # Loop over OTUs in paraller
+      results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+        fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="count", n.rep=500, family=family)
+        c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim)
+      }
+      # Save p-values from both log likelihood and prr-test
+      results.model <- as.data.frame(results.model) %>% 
+        mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      
+      results.models[[model]] <- results.model
+      # Time per model
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.models <- bind_rows(results.models, .id = "family") 
+    
+    results <- rbind(results.tests, results.models)
+    results$effect <- effect
+    results$experiment <- i
+    suppressWarnings({write.table(results, fn, sep=";", dec=",", append=T, col.names=(i==1) & (effect==effects[[1]]), row.names=F)})
+  }
+}
+
+```
+
+```{r}
+results <- read.table(file="results.csv", sep=";", dec=",", header = T)
+results <- subset(results, subset = !(family %in% c("oneway_test", "kruskal_test")))
+# Combine model and p-value calculation method into a single factor
+results$model <- factor(paste0(sprintf("%s (%s)", results$family, results$type)), levels=model.names)
+```
+
+Table with effect +100%:
+
+```{r}
+results.1 <- results %>% filter(effect == 2.0) # results.1 <- results %>% filter(effect == unique(results$effect)[[3]])
+
+# Calculate statistics for each experiment and display the mean
+stats <- results.1 %>% 
+  group_by(experiment, model) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
+  group_by(model) %>%
+  summarize(AUC.avg     = round(mean(AUC), 2), 
+            AUC.sd      = round(sd(AUC)/sqrt(n.simulations), 2), 
+            Power.avg   = round(mean(Power), 2), 
+            Power.sd    = round(sd(Power)/sqrt(n.simulations), 2), 
+            FPR.avg     = round(mean(FPR), 2),
+            FPR.sd      = round(sd(FPR)/sqrt(n.simulations), 2)) %>%
+            #PowerAt.avg = round(mean(PowerAt), 2),
+            #PowerAt.sd  = round(sd(PowerAt), 2)) %>%
+  transmute(model=model,
+    AUC   = paste(AUC.avg, sprintf("($\\pm%.2f$)", AUC.sd)),
+    Power = paste(Power.avg, sprintf("($\\pm%.2f$)", Power.sd)),
+    FPR   = paste(FPR.avg, sprintf("($\\pm%.2f$)", FPR.sd)))
+write.csv(stats, "stats.csv", row.names=F)
+print.data.frame(stats)
+```
+
+Plot with effect sizes +25%, ..., +400%:
+
+```{r}
+results.2 <- results %>% mutate(effect=(effect-1)*100) # results.2 <- results %>% mutate(effect=(exp(effect)-1)*100)
+
+# Calculate statistics for each effect size
+stats <- results.2 %>% 
+  group_by(experiment, model, effect) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
+  group_by(model, effect) %>%
+  summarize(AUC     = round(mean(AUC), 2), 
+            Power   = round(mean(Power), 2), 
+            FPR     = round(mean(FPR), 2)) %>%
+  pivot_longer(c(AUC, Power, FPR), names_to = "metric", values_to = "value") %>% 
+  mutate(family = recode(model, !!!model.family))
+
+# Plot statistics for each effect size
+ggplot(stats, aes(x=effect, y=value, col=model, linetype=model)) + 
+  geom_line() +
+  scale_linetype_manual(values = rep(c("dashed", "solid"), length.out=16)) +
+  scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
+  facet_grid(family ~ metric) + theme_bw() + #xlab("log(effect)")
+  labs(title="Metrics as a function of effect size", x="Effect size", y="value") +
+  scale_x_continuous(trans="log", breaks=c(25, 50, 100, 200, 400), labels=paste0("+",c(25, 50, 100, 200, 400), "%")) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ggsave("metrics.eps", height = 4.5 , width = 6.5, dpi=240)
+```
+
+```{r}
+# Calculate ROC with confidence intervals
+roc <- results.1 %>%
+  group_by(experiment, model) %>%
+  group_modify(~ simple_roc2(.x$y_true, 1-.x$p_value)) %>%
+  group_by(model, TPR) %>%
+  summarize(FPR.mean=mean(FPR))%>% 
+  mutate(family = recode(model, !!!model.family))
+# Plot
+ggplot(roc, aes(x=FPR.mean, y=TPR, col=model, linetype=model)) +
+  geom_step() +
+  scale_linetype_manual(values = rep(c("solid", "dashed"), length.out=16)) +
+  scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
+  labs(title="ROC curve", x="FPR", "TPR") + theme_bw() + facet_grid(family ~ .)
+ggsave("roc.eps", height = 4.5 , width = 6.5, dpi=240)
+```
+
+### Signal in counts + zeros
+
+Experiment:
+
+```{r}
+fn <- "results_both.csv"
+if (file.exists(fn))
+	file.remove(fn)
+
+# Loop over generated data sets 
+for (i in 1:n.simulations) {
+  print(sprintf("===== Experiment %d =====", i))
+
+  for (effect in effects) {
+  print(sprintf("*** Effect %.2f ***", effect))
+    
+    # Create simulated signal in real data
+    diff.effects <- list(
+      "Group" = list("meateater" = effect, "fisheater" = effect, "vegetarian" = effect, "vegan" = effect)
+    )
+    signal <- generate_signal(strata, sample.size=nrow(otu.counts), otu.names, diff.abundant, diff.effects)
+    data   <- data_simulate(otu.counts, otu.names, strata=strata, signal, which="both")
+    
+    # This is the data.frame of simulated data and true answers
+    otu.simulated <- data$X
+    otu.simulated$Group <- as.factor(otu.simulated$Group)
+    otu.true <- data.frame(otu=otu.names, y_true=as.integer(otu.names %in% data$y))
+      
+    # Loop over statistical tests
+    results.tests <- list()
+    for (test in names(tests)) {
+      print(test)
+      start <- Sys.time()
+      str.tests <- tests[[test]]
+      testf <- get(test, mode = "function", envir = parent.frame())
+      # Loop over OTUs in paraller
+      results.test <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        pval <- list()
+        for (test.name in names(str.tests)) {
+          str.test <- str.tests[[test.name]]
+          eq <- as.formula(do.call("sprintf", as.list(c(str.test, rep(otu, str_count(str.test, "%s"))))))
+          subset = NULL
+          if (test.name == "strata") {
+            n.in.strata <- table(otu.simulated$Strata)
+            subset = otu.simulated$Strata %in% names(n.in.strata[n.in.strata > 1])
+          }
+          fit <- testf(eq, data=otu.simulated, subset=subset, distribution=approximate(nresample=500))
+          pval[[test.name]] <- pvalue(fit)
+        }
+        otu.result <- c(otu=otu, unlist(pval))
+        otu.result
+      }
+      # Save p-values from different test types
+      results.test <- as.data.frame(results.test) %>% 
+        mutate(basic = basic %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(basic), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      results.tests[[test]] <- results.test
+      # Time per test
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.tests <- bind_rows(results.tests, .id = "family") 
+  
+    # Loop over models
+    results.models <- list()
+    for (model in names(models)) {
+      print(model)
+      start <- Sys.time()
+      str.model <- models[[model]]
+      family <- get(model, mode = "function", envir = parent.frame())
+      
+      # Loop over OTUs in paraller
+      results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+        fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=500, family=family)
+        c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim)
+      }
+      # Save p-values from both log likelihood and prr-test
+      results.model <- as.data.frame(results.model) %>% 
+        mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      
+      results.models[[model]] <- results.model
+      # Time per model
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.models <- bind_rows(results.models, .id = "family") 
+    
+    results <- rbind(results.tests, results.models)
+    results$effect <- effect
+    results$experiment <- i
+    suppressWarnings({write.table(results, fn, sep=";", dec=",", append=T, col.names=(i==1) & (effect==effects[[1]]), row.names=F)})
+  }
+}
+
+```
+
+
+```{r}
+results <- read.table(file="results_both.csv", sep=";", dec=",", header = T)
+results <- subset(results, subset = !(family %in% c("oneway_test", "kruskal_test")))
+# Combine model and p-value calculation method into a single factor
+results$model <- factor(paste0(sprintf("%s (%s)", results$family, results$type)), levels=model.names)
+
+```
+
+Table with effect +100%:
+
+```{r}
+results.1 <- results %>% filter(effect == 2.0) # results.1 <- results %>% filter(effect == unique(results$effect)[[3]])
+
+# Calculate statistics for each experiment and display the mean
+stats <- results.1 %>% 
+  group_by(experiment, model) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
+  group_by(model) %>%
+  summarize(AUC.avg     = round(mean(AUC), 2), 
+            AUC.sd      = round(sd(AUC)/sqrt(n.simulations), 2), 
+            Power.avg   = round(mean(Power), 2), 
+            Power.sd    = round(sd(Power)/sqrt(n.simulations), 2), 
+            FPR.avg     = round(mean(FPR), 2),
+            FPR.sd      = round(sd(FPR)/sqrt(n.simulations), 2)) %>%
+            #PowerAt.avg = round(mean(PowerAt), 2),
+            #PowerAt.sd  = round(sd(PowerAt), 2)) %>%
+  transmute(model=model,
+    AUC   = paste(AUC.avg, sprintf("($\\pm%.2f$)", AUC.sd)),
+    Power = paste(Power.avg, sprintf("($\\pm%.2f$)", Power.sd)),
+    FPR   = paste(FPR.avg, sprintf("($\\pm%.2f$)", FPR.sd)))
+write.csv(stats, "stats_both.csv", row.names=F)
+print.data.frame(stats)
+```
+
+Plot with effect sizes +25%, ..., +400%:
+
+```{r}
+results.2 <- results %>% mutate(effect=(effect-1)*100) # results.2 <- results %>% mutate(effect=(exp(effect)-1)*100)
+
+# Calculate statistics for each effect size
+stats <- results.2 %>% 
+  group_by(experiment, model, effect) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
+  group_by(model, effect) %>%
+  summarize(AUC     = round(mean(AUC), 2), 
+            Power   = round(mean(Power), 2), 
+            FPR     = round(mean(FPR), 2)) %>%
+  pivot_longer(c(AUC, Power, FPR), names_to = "metric", values_to = "value") %>% 
+  mutate(family = recode(model, !!!model.family))
+
+# Plot statistics for each effect size
+ggplot(stats, aes(x=effect, y=value, col=model, linetype=model)) + 
+  geom_line() +
+  scale_linetype_manual(values = rep(c("dashed", "solid"), length.out=16)) +
+  scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
+  facet_grid(family ~ metric) + theme_bw() + #xlab("log(effect)")
+  labs(title="Metrics as a function of effect size", x="Effect size", y="value") +
+  scale_x_continuous(trans="log", breaks=c(25, 50, 100, 200, 400), labels=paste0("+",c(25, 50, 100, 200, 400), "%")) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ggsave("metrics_both.eps", height = 4.5 , width = 6.5, dpi=240)
+```
+
+```{r}
+# Calculate ROC with confidence intervals
+roc <- results.1 %>%
+  group_by(experiment, model) %>%
+  group_modify(~ simple_roc2(.x$y_true, 1-.x$p_value)) %>%
+  group_by(model, TPR) %>%
+  summarize(FPR.mean=mean(FPR))%>% 
+  mutate(family = recode(model, !!!model.family))
+# Plot
+ggplot(roc, aes(x=FPR.mean, y=TPR, col=model, linetype=model)) +
+  geom_step() +
+  scale_linetype_manual(values = rep(c("solid", "dashed"), length.out=16)) +
+  scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
+  labs(title="ROC curve", x="FPR", "TPR") + theme_bw() + facet_grid(family ~ .)
+ggsave("roc_both.eps", height = 4.5 , width = 6.5, dpi=240)
+```
+
+## Regression
+
+Specification of models:
+
+```{r}
+tests <- list(
+  "oneway_test"          = list(basic="%s ~ Group", strata="%s ~ Group | Strata"),
+  "kruskal_test"         = list(basic="%s ~ Group", strata="%s ~ Group | Strata")
+)
+
+models <- list(
+  "Poisson"    = "%s ~ Group + Covariate + Age + offset(log(library_size))",
+  "Binomial"   = "cbind(%s, library_size - %s) ~ Group + Covariate + Age",
+  "NegativeBinomial"     = "%s ~ Group + Covariate + Age + offset(log(library_size))",
+  "BetaBinomial"    = "cbind(%s, library_size - %s) ~ Group + Covariate + Age", 
+  "ZIPoisson"  = "%s ~ Group + Covariate + Age + offset(log(library_size)) | Group + Covariate + Age + offset(log(library_size))",
+  "ZIBinomial" = "cbind(%s, library_size - %s) ~ Group + Covariate + Age | Group + Covariate + Age",
+  "ZINegativeBinomial"   = "%s ~ Group + Covariate + Age + offset(log(library_size)) | Group + Covariate + Age + offset(log(library_size))",
+  "ZIBetaBinomial"  = "cbind(%s, library_size - %s) ~ Group + Covariate + Age | Group + Covariate + Age"
+)
+```
+
+Specification of signal: 
+
+```{r}
+ages <- as.character(seq(20,69))
+strata.1 <- data.frame(Group = rep(c("meateater", "fisheater", "vegetarian", "vegan"), 2), 
+                       Covariate= c(rep("urbanlow", 4), rep("urbanhigh", 4)),
+                       Probability=c(c(0.4, 0.3, 0.2, 0.1)/2, c(0.1, 0.2, 0.3, 0.4)/2))
+strata.2 <- data.frame(Group = c(rep("meateater", 50), rep("fisheater", 50), rep("vegetarian", 50), rep("vegan", 50)), 
+                       Age = rep(ages, 4),
+                       Probability=c(c(rep(0.00,10)/10, rep(0.10,10)/10, rep(0.20,10)/10, rep(0.30,10)/10, rep(0.40,10)/10), 
+                                     c(rep(0.10,10)/10, rep(0.15,10)/10, rep(0.20,10)/10, rep(0.25,10)/10, rep(0.30,10)/10),
+                                     c(rep(0.30,10)/10, rep(0.25,10)/10, rep(0.20,10)/10, rep(0.15,10)/10, rep(0.10,10)/10),
+                                     c(rep(0.40,10)/10, rep(0.30,10)/10, rep(0.20,10)/10, rep(0.10,10)/10, rep(0.00,10)/10)))
+# Alternative: binned age
+# strata.2 <- data.frame(Group = c(rep("meateater", 5), rep("fisheater", 5), rep("vegetarian", 5), rep("vegan", 5)), 
+#                        Age=rep(c(20, 30, 40, 50, 60), 2),
+#                        Probability=c(c(0.00, 0.10, 0.20, 0.30, 0.40), 
+#                                      c(0.10, 0.15, 0.20, 0.25, 0.30),
+#                                      c(0.30, 0.25, 0.20, 0.15, 0.10),
+#                                      c(0.40, 0.30, 0.20, 0.10, 0.0)))
+strata <- merge(strata.1, strata.2, by="Group")
+strata$Probability = strata$Probability.x * strata$Probability.y
+strata$Probability.x <- NULL
+strata$Probability.y <- NULL
+
+# Same OTUs are differentially abundant for each age, but the effect increases linearly over age
+age.otus <- sample(otu.names, length(otu.names)/10)
+age.diff <- setNames(lapply(ages, function (age) age.otus), ages)
+age.effect <- setNames(exp(seq(log(1),log(5),length.out=50)), ages)
+
+# These taxa are differentially abundant in each group
+diff.abundant <- list(
+  "Group" = list(
+    "meateater" = sample(otu.names, length(otu.names)/10),
+    "fisheater" = sample(otu.names, length(otu.names)/10),
+    "vegetarian" = sample(otu.names, length(otu.names)/10),
+    "vegan" = sample(otu.names, length(otu.names)/10)
+  ),
+  "Covariate" = list(
+    "urbanlow" = sample(otu.names, length(otu.names)/10),
+    "urbanhigh" = sample(otu.names, length(otu.names)/10)
+  ),
+  "Age" = age.diff
+)
+```
+
+### Signal: counts (with co-founding)
+
+Experiment: 
+
+```{r}
+fn <- "results_cofounding.csv"
+if (file.exists(fn))
+	file.remove(fn)
+
+# Loop over generated data sets 
+for (i in 1:n.simulations) {
+  print(sprintf("===== Experiment %d =====", i))
+
+  for (effect in effects) {
+    print(sprintf("*** Effect %.2f ***", effect))
+    
+    # Create simulated signal in real data
+    diff.effects <- list(
+      "Group" = list("meateater" = effect, "fisheater" = effect, "vegetarian" = effect, "vegan" = effect), 
+      "Covariate" = list("urbanlow" = 3, "urbanhigh" = 3),
+      "Age" = age.effect
+    )
+    signal <- generate_signal(strata, sample.size=nrow(otu.counts), otu.names, diff.abundant, diff.effects)
+    data <- data_simulate(otu.counts, otu.names, strata=strata, signal, which="count")
+    
+    # This is the data.frame of simulated data and true answers
+    otu.simulated <- data$X
+    otu.simulated$Group = as.factor(otu.simulated$Group)
+    otu.simulated$Covariate = as.factor(otu.simulated$Covariate)
+    otu.simulated$Age = as.numeric(otu.simulated$Age)
+    otu.simulated$AgeCat = cut(otu.simulated$Age, c(20,30,40,50,60,70), right=F)
+    otu.simulated$Strata <- factor(with(otu.simulated, paste(Covariate, AgeCat, sep=",")))
+    otu.true <- data.frame(otu=otu.names, y_true=as.integer(otu.names %in% data$y))
+    
+    # Loop over statistical tests
+    results.tests <- list()
+    for (test in names(tests)) {
+      print(test)
+      start <- Sys.time()
+      str.tests <- tests[[test]]
+      testf <- get(test, mode = "function", envir = parent.frame())
+      # Loop over OTUs in paraller
+      results.test <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        pval <- list()
+        for (test.name in names(str.tests)) {
+          str.test <- str.tests[[test.name]]
+          eq <- as.formula(do.call("sprintf", as.list(c(str.test, rep(otu, str_count(str.test, "%s"))))))
+          subset = NULL
+          if (test.name == "strata") {
+            n.in.strata <- table(otu.simulated$Strata)
+            subset = otu.simulated$Strata %in% names(n.in.strata[n.in.strata > 1])
+          }
+          fit <- testf(eq, data=otu.simulated, subset=subset, distribution=approximate(nresample=500))
+          pval[[test.name]] <- pvalue(fit)
+        }
+        otu.result <- c(otu=otu, unlist(pval))
+        otu.result
+      }
+      # Save p-values from different test types
+      results.test <- as.data.frame(results.test) %>% 
+        mutate(basic = basic %>% as.numeric, strata = strata %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(basic, strata), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      results.tests[[test]] <- results.test
+      # Time per test
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.tests <- bind_rows(results.tests, .id = "family") 
+  
+    # Loop over models
+    results.models <- list()
+    for (model in names(models)) {
+      print(model)
+      start <- Sys.time()
+      str.model <- models[[model]]
+      family <- get(model, mode = "function", envir = parent.frame())
+      
+      # Loop over OTUs in paraller
+      results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+        fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="count", n.rep=500, family=family)
+        c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim)
+      }
+      # Save p-values from both log likelihood and prr-test
+      results.model <- as.data.frame(results.model) %>% 
+        mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      
+      results.models[[model]] <- results.model
+      # Time per model
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.models <- bind_rows(results.models, .id = "family") 
+    
+    results <- rbind(results.tests, results.models)
+    results$effect <- effect
+    results$experiment <- i
+    suppressWarnings({write.table(results, fn, sep=";", dec=",", append=T, col.names=(i==1) & (effect==effects[[1]]), row.names=F)})
+  }
+}
+
+```
+
+```{r}
+results <- read.table(file="results_cofounding.csv", sep=";", dec=",", header = T)
+results <- subset(results, subset = !(family %in% c("oneway_test", "kruskal_test")))
+# Combine model and p-value calculation method into a single factor
+results$model <- factor(paste0(sprintf("%s (%s)", results$family, results$type)), levels=model.names)
+
+```
+
+Table with effect +100%:
+
+```{r}
+results.1 <- results %>% filter(effect == 2.0) # results.1 <- results %>% filter(effect == unique(results$effect)[[3]])
+
+# Calculate statistics for each experiment and display the mean
+stats <- results.1 %>% 
+  group_by(experiment, model) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
+  group_by(model) %>%
+  summarize(AUC.avg     = round(mean(AUC), 2), 
+            AUC.sd      = round(sd(AUC)/sqrt(n.simulations), 2), 
+            Power.avg   = round(mean(Power), 2), 
+            Power.sd    = round(sd(Power)/sqrt(n.simulations), 2), 
+            FPR.avg     = round(mean(FPR), 2),
+            FPR.sd      = round(sd(FPR)/sqrt(n.simulations), 2)) %>%
+            #PowerAt.avg = round(mean(PowerAt), 2),
+            #PowerAt.sd  = round(sd(PowerAt), 2)) %>%
+  transmute(model=model,
+    AUC   = paste(AUC.avg, sprintf("($\\pm%.2f$)", AUC.sd)),
+    Power = paste(Power.avg, sprintf("($\\pm%.2f$)", Power.sd)),
+    FPR   = paste(FPR.avg, sprintf("($\\pm%.2f$)", FPR.sd)))
+write.csv(stats, "stats_cofounding.csv", row.names=F)
+print.data.frame(stats)
+```
+
+Plot with effect sizes +25%, ..., +400%:
+
+```{r}
+results.2 <- results %>% mutate(effect=(effect-1)*100) # results.2 <- results %>% mutate(effect=(exp(effect)-1)*100)
+
+# Calculate statistics for each effect size
+stats <- results.2 %>% 
+  group_by(experiment, model, effect) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
+  group_by(model, effect) %>%
+  summarize(AUC     = round(mean(AUC), 2), 
+            Power   = round(mean(Power), 2), 
+            FPR     = round(mean(FPR), 2)) %>%
+  pivot_longer(c(AUC, Power, FPR), names_to = "metric", values_to = "value") %>% 
+  mutate(family = recode(model, !!!model.family))
+
+# Plot statistics for each effect size
+ggplot(stats, aes(x=effect, y=value, col=model, linetype=model)) + 
+  geom_line() +
+  scale_linetype_manual(values = rep(c("dashed", "solid"), length.out=16)) +
+  scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
+  facet_grid(family ~ metric) + theme_bw() + #xlab("log(effect)")
+  labs(title="Metrics as a function of effect size", x="Effect size", y="value") +
+  scale_x_continuous(trans="log", breaks=c(25, 50, 100, 200, 400), labels=paste0("+",c(25, 50, 100, 200, 400), "%")) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ggsave("metrics_cofounding.eps", height = 4.5 , width = 6.5, dpi=240)
+```
+
+```{r}
+# Calculate ROC with confidence intervals
+roc <- results.1 %>%
+  group_by(experiment, model) %>%
+  group_modify(~ simple_roc2(.x$y_true, 1-.x$p_value)) %>%
+  group_by(model, TPR) %>%
+  summarize(FPR.mean=mean(FPR))%>% 
+  mutate(family = recode(model, !!!model.family))
+# Plot
+ggplot(roc, aes(x=FPR.mean, y=TPR, col=model, linetype=model)) +
+  geom_step() +
+  scale_linetype_manual(values = rep(c("solid", "dashed"), length.out=16)) +
+  scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
+  labs(title="ROC curve", x="FPR", "TPR") + theme_bw() + facet_grid(family ~ .)
+ggsave("roc_cofounding.eps", height = 4.5 , width = 6.5, dpi=240)
+```
+
+
+### Signal: counts + zeros (with co-founding)
+
+Experiments: 
+
+```{r}
+fn <- "results_cofounding_both.csv"
+if (file.exists(fn))
+	file.remove(fn)
+
+# Loop over generated data sets 
+for (i in 1:n.simulations) {
+  print(sprintf("===== Experiment %d =====", i))
+
+  for (effect in effects) {
+    print(sprintf("*** Effect %.2f ***", effect))
+    
+    # Create simulated signal in real data
+    diff.effects <- list(
+      "Group" = list("meateater" = effect, "fisheater" = effect, "vegetarian" = effect, "vegan" = effect), 
+      "Covariate" = list("urbanlow" = 3, "urbanhigh" = 3),
+      "Age" = age.effect
+    )
+    signal <- generate_signal(strata, sample.size=nrow(otu.counts), otu.names, diff.abundant, diff.effects)
+    data <- data_simulate(otu.counts, otu.names, strata=strata, signal, which="both")
+    
+    # This is the data.frame of simulated data and true answers
+    otu.simulated <- data$X
+    otu.simulated$Group = as.factor(otu.simulated$Group)
+    otu.simulated$Covariate = as.factor(otu.simulated$Covariate)
+    otu.simulated$Age = as.numeric(otu.simulated$Age)
+    otu.simulated$AgeCat = cut(otu.simulated$Age, c(20,30,40,50,60,70), right=F)
+    otu.simulated$Strata <- factor(with(otu.simulated, paste(Covariate, AgeCat, sep=",")))
+    otu.true <- data.frame(otu=otu.names, y_true=as.integer(otu.names %in% data$y))
+    
+    # Loop over statistical tests
+    results.tests <- list()
+    for (test in names(tests)) {
+      print(test)
+      start <- Sys.time()
+      str.tests <- tests[[test]]
+      testf <- get(test, mode = "function", envir = parent.frame())
+      # Loop over OTUs in paraller
+      results.test <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        pval <- list()
+        for (test.name in names(str.tests)) {
+          str.test <- str.tests[[test.name]]
+          eq <- as.formula(do.call("sprintf", as.list(c(str.test, rep(otu, str_count(str.test, "%s"))))))
+          subset = NULL
+          if (test.name == "strata") {
+            n.in.strata <- table(otu.simulated$Strata)
+            subset = otu.simulated$Strata %in% names(n.in.strata[n.in.strata > 1])
+          }
+          fit <- testf(eq, data=otu.simulated, subset=subset, distribution=approximate(nresample=500))
+          pval[[test.name]] <- pvalue(fit)
+        }
+        otu.result <- c(otu=otu, unlist(pval))
+        otu.result
+      }
+      # Save p-values from different test types
+      results.test <- as.data.frame(results.test) %>% 
+        mutate(basic = basic %>% as.numeric, strata = strata %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(basic, strata), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      results.tests[[test]] <- results.test
+      # Time per test
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.tests <- bind_rows(results.tests, .id = "family") 
+  
+    # Loop over models
+    results.models <- list()
+    for (model in names(models)) {
+      print(model)
+      start <- Sys.time()
+      str.model <- models[[model]]
+      family <- get(model, mode = "function", envir = parent.frame())
+      
+      # Loop over OTUs in paraller
+      results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+        fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=500, family=family)
+        c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim)
+      }
+      # Save p-values from both log likelihood and prr-test
+      results.model <- as.data.frame(results.model) %>% 
+        mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      
+      results.models[[model]] <- results.model
+      # Time per model
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.models <- bind_rows(results.models, .id = "family") 
+    
+    results <- rbind(results.tests, results.models)
+    results$effect <- effect
+    results$experiment <- i
+    suppressWarnings({write.table(results, fn, sep=";", dec=",", append=T, col.names=(i==1) & (effect==effects[[1]]), row.names=F)})
+  }
+}
+
+```
+
+
+
+```{r}
+results <- read.table(file="results_cofounding_both.csv", sep=";", dec=",", header = T)
+results <- subset(results, subset = !(family %in% c("oneway_test", "kruskal_test")))
+# Combine model and p-value calculation method into a single factor
+results$model <- factor(paste0(sprintf("%s (%s)", results$family, results$type)), levels=model.names)
+
+```
+
+Table with effect +100%:
+
+```{r}
+results.1 <- results %>% filter(effect == 2.0) # results.1 <- results %>% filter(effect == unique(results$effect)[[3]])
+
+# Calculate statistics for each experiment and display the mean
+stats <- results.1 %>% 
+  group_by(experiment, model) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
+  group_by(model) %>%
+  summarize(AUC.avg     = round(mean(AUC), 2), 
+            AUC.sd      = round(sd(AUC)/sqrt(n.simulations), 2), 
+            Power.avg   = round(mean(Power), 2), 
+            Power.sd    = round(sd(Power)/sqrt(n.simulations), 2), 
+            FPR.avg     = round(mean(FPR), 2),
+            FPR.sd      = round(sd(FPR)/sqrt(n.simulations), 2)) %>%
+            #PowerAt.avg = round(mean(PowerAt), 2),
+            #PowerAt.sd  = round(sd(PowerAt), 2)) %>%
+  transmute(model=model,
+    AUC   = paste(AUC.avg, sprintf("($\\pm%.2f$)", AUC.sd)),
+    Power = paste(Power.avg, sprintf("($\\pm%.2f$)", Power.sd)),
+    FPR   = paste(FPR.avg, sprintf("($\\pm%.2f$)", FPR.sd)))
+write.csv(stats, "stats_cofounding_both.csv", row.names=F)
+print.data.frame(stats)
+```
+
+Plot with effect sizes +25%, ..., +400%:
+
+```{r}
+results.2 <- results %>% mutate(effect=(effect-1)*100) # results.2 <- results %>% mutate(effect=(exp(effect)-1)*100)
+
+# Calculate statistics for each effect size
+stats <- results.2 %>% 
+  group_by(experiment, model, effect) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
+  group_by(model, effect) %>%
+  summarize(AUC     = round(mean(AUC), 2), 
+            Power   = round(mean(Power), 2), 
+            FPR     = round(mean(FPR), 2)) %>%
+  pivot_longer(c(AUC, Power, FPR), names_to = "metric", values_to = "value") %>% 
+  mutate(family = recode(model, !!!model.family))
+
+# Plot statistics for each effect size
+ggplot(stats, aes(x=effect, y=value, col=model, linetype=model)) + 
+  geom_line() +
+  scale_linetype_manual(values = rep(c("dashed", "solid"), length.out=16)) +
+  scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
+  facet_grid(family ~ metric) + theme_bw() + #xlab("log(effect)")
+  labs(title="Metrics as a function of effect size", x="Effect size", y="value") +
+  scale_x_continuous(trans="log", breaks=c(25, 50, 100, 200, 400), labels=paste0("+",c(25, 50, 100, 200, 400), "%")) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ggsave("metrics_cofounding_both.eps", height = 4.5 , width = 6.5, dpi=240)
+```
+
+```{r}
+# Calculate ROC with confidence intervals
+roc <- results.1 %>%
+  group_by(experiment, model) %>%
+  group_modify(~ simple_roc2(.x$y_true, 1-.x$p_value)) %>%
+  group_by(model, TPR) %>%
+  summarize(FPR.mean=mean(FPR))%>% 
+  mutate(family = recode(model, !!!model.family))
+# Plot
+ggplot(roc, aes(x=FPR.mean, y=TPR, col=model, linetype=model)) +
+  geom_step() +
+  scale_linetype_manual(values = rep(c("solid", "dashed"), length.out=16)) +
+  scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
+  labs(title="ROC curve", x="FPR", "TPR") + theme_bw() + facet_grid(family ~ .)
+ggsave("roc_cofounding_both.eps", height = 4.5 , width = 6.5, dpi=240)
+```
+
+## Finally
+
+```{r}
+stopImplicitCluster()
+
+```

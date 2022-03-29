@@ -14,11 +14,7 @@ We extend the original implementation in three ways:
 
 # Installation
 
-Simple:
 `devtools::install_git("https://gitl01-int-p.rivm.nl/viljanem/llperm")`
-
-If you cannot install the package, it is possible to just download the .zip and source all files:
-`sapply(file.path("llperm", "R", list.files(file.path("llperm", "R"), pattern="*.R")),source,.GlobalEnv)`
 
 # Usage
 
