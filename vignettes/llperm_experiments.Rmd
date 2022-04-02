@@ -184,7 +184,7 @@ with(otu.counts, print(sprintf("%.2f, %.2f", mean(ASV305), var(ASV305))))
 
 ```{r}
 set.seed(42)
-n.simulations <- 1 # simulate data and repeat the experiments n times to reduce sampling variance
+n.simulations <- 25 # simulate data and repeat the experiments n times to reduce sampling variance
 effects <- c(1.25, 1.5, 2.0, 3.0, 5.0) # multiply counts by effect, i.e. +25%, +50%, +100%, +200%, +400% 
 
 model.names <- c("Poisson", "ZIPoisson", "NegativeBinomial", "ZINegativeBinomial", 
@@ -314,7 +314,7 @@ for (i in 1:n.simulations) {
       results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
         otu <- otu.names[[i]]
         eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
-        fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="count", n.rep=500, family=family)
+        fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=500, family=family)
         c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim)
       }
       # Save p-values from both log likelihood and prr-test
@@ -754,7 +754,7 @@ for (i in 1:n.simulations) {
       results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
         otu <- otu.names[[i]]
         eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
-        fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="count", n.rep=500, family=family)
+        fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=500, family=family)
         c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim)
       }
       # Save p-values from both log likelihood and prr-test
