@@ -1,0 +1,1188 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, rows.print=25)
+```
+
+# Preliminaries
+
+Load the required libraries.
+
+```{r, imports, message=FALSE, warning=FALSE}
+library(coin)
+library(llperm)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(RColorBrewer)
+
+```
+
+Use parallel processing (optional).
+
+```{r}
+library(stringr)
+library(parallel)
+library(foreach)
+library(doParallel)
+numCores <- 10 #detectCores()
+registerDoParallel(numCores) # use multicore, set to the number of our cores
+```
+
+```{r}
+# Variables: Sample size, Effect size, (Overdispersion)
+#
+# Data sets:
+#    - Data: Real / Simulated (ZINB, ZIBB, log.reg + log-linear ls)
+#    - Variables: Diet group, Diet group + confounding variables
+#    - Diet group signal: Counts / Zeros / Both
+#    - Confounding non-signal: library size, counts variance
+#
+#  Distributions
+
+# Poisson family  ----------- overdispersion ------------> 
+#  | zeros        Poisson                     Negative Binomial    
+# \_/             Zero-Inflated Poisson       Zero-Inflated Negative Binomial 
+#
+# Binomial family ----------- overdispersion ------------> 
+#  | zeros        Binomial                    Beta Binomial       
+# \_/             Zero-Inflated Binomial      Zero-Inflated Beta Binomial
+#
+
+```
+
+## Functions
+
+```{r}
+# Generate simulated signal from strata defined by a combination of features, 
+#   each feature value makes given OTUs independently differentially abundant
+generate_signal <- function (strata, sample.size, otu.names, diff.abundant, effects) {
+  # Randomly sample a data frame of features from a given strata definition
+  idx <- sample(1:nrow(strata), sample.size, replace=T, prob=strata$Probability)
+  df.features <- strata[idx,]
+  # Define effects X
+  X <- array(1, c(sample.size,length(otu.names)), list(1:sample.size, otu.names))
+  # Loop over every person and define their OTU effect  
+  for (i in 1:sample.size) {
+    person <- df.features[i,]
+    for (feature in names(diff.abundant)) {
+      otus <- diff.abundant[[feature]][[person[[feature]]]]
+      X[i, otus] = X[i, otus] * effects[[feature]][[person[[feature]]]]
+    }
+  }
+  # These OTUs are truly differentially abundant (affected by Group)
+  diff.abundant <- unique(unlist(diff.abundant$Group))
+  return(list(df.effects=X, df.features=df.features, diff.abundant=diff.abundant))
+}
+
+# Given a real data set of OTU counts, simulate signal in the data set by multiplying counts
+data_simulate <- function(otu.counts, otu.names, strata=NULL, signal, which="both") {
+  # These are the real data OTU counts
+  otu.simulated <- otu.counts[,otu.names]
+  # Add signal and features if relevant
+  if (!is.null(strata)) {
+    if (which != "count") {
+      for (i in 1:ncol(otu.simulated)) {
+        otu.n <- otu.simulated[,i]
+        otu.n.nonzero <- otu.n[otu.n > 0]
+        odds <- sum(otu.n > 0) / sum(otu.n == 0) * signal$df.effects[,i]
+        non.zero <- sample(1:length(otu.n), size=length(otu.n.nonzero), replace=F, prob=1 / (1 + 1/odds))
+        otu.simulated[,i]         <- 0
+        otu.simulated[non.zero,i] <- otu.n.nonzero
+      }
+    }
+    if (which != "zero") 
+      otu.simulated <- round(otu.simulated * signal$df.effects)
+    otu.simulated$library_size <- rowSums(otu.simulated)
+    otu.simulated <- data.frame(otu.simulated, signal$df.features)
+  }
+  return(list(X=otu.simulated, 
+              y=if (!is.null(strata)) signal$diff.abundant else NULL))
+}
+
+```
+
+```{r}
+# Simple ROC curve calculation
+simple_roc <- function(labels, scores){
+  labels <- labels[order(scores, decreasing=TRUE)]
+  data.frame(TPR=cumsum(labels)/sum(labels), FPR=cumsum(!labels)/sum(!labels), labels)
+}
+
+# Simple ROC curve calculation (with interpolation)
+simple_roc2 <- function(labels, scores, FPR.out=seq(0.00,1.00,0.01)){
+  labels <- labels[order(scores, decreasing=TRUE)]
+  temp <- data.frame(x=cumsum(labels)/sum(labels), 
+                     y=cumsum(!labels)/sum(!labels))
+  if (!is.null(FPR.out)) 
+    temp <- suppressWarnings(approx(temp$x, temp$y, xout=FPR.out, yleft=0, yright=1))
+  data.frame(TPR=temp$x, FPR=temp$y)
+}
+
+# Simple statistics calculation
+simple_stats <- function(labels, scores, threshold=0.05, decreasing=FALSE){
+  labels <- labels[order(scores, decreasing=decreasing)]
+  scores <- scores[order(scores, decreasing=decreasing)]
+  # Calculate AUC
+  AUC <- 1 - sum(labels * cumsum(!labels)) / (sum(!labels) * sum(labels))
+  # Calculate Power at a given False Discovery Rate (FDR)
+  TPR <- cumsum(labels)/sum(labels)
+  FPR <- cumsum(!labels)/sum(!labels)
+  PowerAt <- TPR[which.min(abs(FPR - threshold))]
+  # Calculate Power = TP/P and FDR = FP/N
+  labels_pred <- if (decreasing) scores > threshold else scores <= threshold
+  Power   <- sum(labels_pred & labels)/sum(labels)
+  FPR     <- sum(labels_pred & !labels)/sum(!labels)
+  results <- data.frame(AUC=AUC, PowerAt=PowerAt, Power=Power, FPR=FPR)
+  return(results)
+}
+```
+
+
+## Load the data set (llperm package)
+
+Load the data set. We have two data frames: OTU table and person metadata.
+
+```{r, load_data}
+fn.sequence <- system.file("extdata", "VEGA_sequences.txt", package = "llperm")
+fn.metadata <- system.file("extdata", "VEGA_metadata.txt", package = "llperm")
+otu.table    <- read.table(fn.sequence, sep="\t", header=T, row.names=1)
+otu.metadata <- read.table(fn.metadata, sep="\t", header=T, row.names=1, stringsAsFactors=T)
+```
+
+## Data frame: OTU counts
+
+Combine these to a single data frame
+
+```{r}
+otu.names <- colnames(otu.table)
+otu.counts <- cbind(otu.table, otu.metadata)
+otu.counts$Sample <- rownames(otu.counts)
+otu.counts$library_size <- rowSums(otu.table)
+```
+
+
+```{r}
+set.seed(42)
+n.simulations <- 25 # simulate data and repeat the experiments n times to reduce sampling variance
+effects <- c(1.25, 1.5, 2.0, 3.0, 5.0) # multiply counts by effect, i.e. +25%, +50%, +100%, +200%, +400% 
+family.names <- c("Poisson", "ZIPoisson", "NegativeBinomial", "ZINegativeBinomial", 
+                 "Binomial", "ZIBinomial", "BetaBinomial", "ZIBetaBinomial")
+model.names <- with(expand.grid(c("loglik", "llperm"), family.names), paste0(sprintf("%s (%s)", Var2, Var1)))
+#test.names <- with(expand.grid(c("basic"), c("oneway_test", "kruskal_test")), 
+#                   paste0(sprintf("%s (%s)", Var2, Var1)))
+#model.names <- c(test.names, model.names)
+model.family <- setNames(c(rep("Poisson",8), rep("Binomial", 8)), model.names)
+```
+
+## P-values from the experiment
+
+```{r}
+results <- read.table(file="results_group_both.csv", sep=";", dec=",", header = F)
+colnames(results) <- c("family","otu","y_true","type","p_value","y_pred","effect","experiment")
+results <- subset(results, subset = !(family %in% c("oneway_test", "kruskal_test")))
+# Combine model and p-value calculation method into a single factor
+results$model <- factor(paste0(sprintf("%s (%s)", results$family, results$type)), levels=model.names)
+```
+
+Relationship between the models (average p-value over the experiments)
+
+```{r}
+pvals <- results %>%
+  filter(effect==2.0) %>% 
+  select(model, otu, y_true, p_value) %>% 
+  group_by(model, otu) %>% 
+  summarize(y_true=as.factor(mean(y_true)), 
+            p_value=mean(p_value)) %>%
+  pivot_wider(names_from=model, values_from=p_value)
+stats <- otu.table %>% 
+  gather(otu, value) %>% 
+  group_by(otu) %>% 
+  summarize(pct.nonzero = sum(value > 0)/n(), magnitude=mean(log(value+1)), variance=var(log(value+1)))
+pvals <- pvals %>% merge(stats)
+ggplot(pvals , aes(x=`NegativeBinomial (loglik)`, y=`BetaBinomial (loglik)`, color=y_true)) + 
+  geom_point() +coord_fixed(ratio = 1, xlim = c(0,1), ylim = c(0,1)) #+ scale_color_gradient(low="blue", high="red")
+```
+
+Relationship between the models (p-value from a single experiment)
+
+```{r}
+pvals <- results %>% filter(experiment==1) %>% mutate(y_true = as.factor(y_true)) %>%
+  filter(effect==2.0) %>% 
+  select(model, otu, p_value, y_true, experiment) %>% 
+  pivot_wider(names_from=model, values_from=p_value)
+zero.values <- otu.table %>% 
+  gather(otu, value) %>% 
+  group_by(otu) %>% 
+  summarize(pct.nonzero = sum(value > 0)/n(), magnitude=mean(log(value+1)), variance=var(log(value+1)))
+pvals <- pvals %>% merge(zero.values)
+ggplot(pvals , aes(x=`NegativeBinomial (loglik)`, y=`BetaBinomial (loglik)`, size=pct.nonzero, color=y_true)) + 
+  geom_jitter(alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("Negative Binomial and Beta Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+Relationship between the models (p-value from all experiments)
+
+```{r}
+pvals <- results %>% mutate(y_true = as.factor(y_true)) %>%
+  filter(effect==2.0) %>% 
+  select(model, otu, p_value, y_true, experiment) %>% 
+  pivot_wider(names_from=model, values_from=p_value)
+zero.values <- otu.table %>% 
+  gather(otu, value) %>% 
+  group_by(otu) %>% 
+  summarize(pct.nonzero = sum(value > 0)/n(), magnitude=mean(log(value+1)), variance=var(log(value+1)))
+pvals <- pvals %>% merge(zero.values)
+ggplot(pvals , aes(x=`NegativeBinomial (loglik)`, y=`BetaBinomial (loglik)`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("Negative Binomial and Beta Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+```{r}
+pvals <- results %>% mutate(y_true = as.factor(y_true)) %>%
+  filter(effect==2.0) %>% 
+  select(model, otu, p_value, y_true, experiment) %>% 
+  pivot_wider(names_from=model, values_from=p_value)
+zero.values <- otu.table %>% 
+  gather(otu, value) %>% 
+  group_by(otu) %>% 
+  summarize(pct.nonzero = sum(value > 0)/n(), magnitude=mean(log(value+1)), variance=var(log(value+1)))
+pvals <- pvals %>% merge(zero.values)
+ggplot(pvals , aes(x=`ZINegativeBinomial (loglik)`, y=`ZIBetaBinomial (loglik)`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("ZI Negative Binomial and ZI Beta Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+```{r}
+pvals <- results %>% mutate(y_true = as.factor(y_true)) %>%
+  filter(effect==2.0) %>% 
+  select(model, otu, p_value, y_true, experiment) %>% 
+  pivot_wider(names_from=model, values_from=p_value)
+zero.values <- otu.table %>% 
+  gather(otu, value) %>% 
+  group_by(otu) %>% 
+  summarize(pct.nonzero = sum(value > 0)/n(), magnitude=mean(log(value+1)), variance=var(log(value+1)))
+pvals <- pvals %>% merge(zero.values)
+ggplot(pvals , aes(x=`Poisson (loglik)`, y=`Binomial (loglik)`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("Poisson and Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+Histogram of p-values
+
+```{r, fig.width=8,fig.height=16}
+pvals <- results %>% mutate(y_true = as.factor(y_true)) %>%
+  filter(effect==2.0) #%>% filter(model == "Poisson (loglik)")
+ggplot(pvals, aes(x=p_value)) + geom_histogram() + facet_wrap(~ model, ncol=2, scales="free")
+```
+
+## Real data with likelihood models: simple signal
+
+```{r}
+models <- list(
+  "Poisson"    = "%s ~ Group + offset(log(library_size))",
+  "Binomial"   = "cbind(%s, library_size - %s) ~ Group ",
+  "NegativeBinomial"     = "%s ~ Group + offset(log(library_size))",
+  "BetaBinomial"    = "cbind(%s, library_size - %s) ~ Group ", 
+  "ZIPoisson"  = "%s ~ Group + offset(log(library_size)) | Group + offset(log(library_size))",
+  "ZIBinomial" = "cbind(%s, library_size - %s) ~ Group | Group ",
+  "ZINegativeBinomial"   = "%s ~ Group + offset(log(library_size)) | Group + offset(log(library_size))",
+  "ZIBetaBinomial"  = "cbind(%s, library_size - %s) ~ Group | Group "
+)
+```
+
+```{r}
+# Specify a simple categeorical distribution for each group
+strata <- data.frame(Group = c("meateater", "fisheater", "vegetarian", "vegan"), 
+                     Probability=c(0.25, 0.25, 0.25, 0.25))
+# These taxa are differentially abundant in each group
+diff.abundant <- list(
+  "Group" = list(
+    "meateater" = sample(otu.names, length(otu.names)/10),
+    "fisheater" = sample(otu.names, length(otu.names)/10),
+    "vegetarian" = sample(otu.names, length(otu.names)/10),
+    "vegan" = sample(otu.names, length(otu.names)/10)
+  )
+)
+effect <- 2.00
+
+# Create simulated signal in real data
+diff.effects <- list(
+  "Group" = list("meateater" = effect, "fisheater" = effect, "vegetarian" = effect, "vegan" = effect)
+)
+signal <- generate_signal(strata, sample.size=nrow(otu.counts), otu.names, diff.abundant, diff.effects)
+data   <- data_simulate(otu.counts, otu.names, strata=strata, signal, which="both")
+
+# This is the data.frame of simulated data and true answers
+otu.simulated <- data$X
+otu.simulated$Group <- as.factor(otu.simulated$Group)
+otu.true <- data.frame(otu=otu.names, y_true=as.integer(otu.names %in% data$y))
+  
+```
+
+```{r}
+# Loop over models
+results.models <- list()
+for (model in names(models)) {
+  print(model)
+  start <- Sys.time()
+  str.model <- models[[model]]
+  family <- get(model, mode = "function", envir = parent.frame())
+  
+  # Loop over OTUs in paraller
+  results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+    otu <- otu.names[[i]]
+    eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+    fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=0, family=family)
+    c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim, value=fit$fit$optim$value, 
+      convergence=fit$fit$optim$convergence, message=fit$fit$optim$message)
+  }
+  # Save p-values from both log likelihood and prr-test
+  results.model <- as.data.frame(results.model) %>% 
+    mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+    inner_join(otu.true, by="otu") %>% 
+    pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+    mutate(y_pred = p_value <= 0.05)
+  
+  results.models[[model]] <- results.model
+  # Time per model
+  end <- Sys.time()
+  print(end-start)
+}
+results.models <- bind_rows(results.models, .id = "family") 
+
+```
+
+```{r}
+# Calculate statistics for each experiment and display the mean
+results.models %>% filter(type == "loglik") %>%
+  group_by(family,type) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) 
+```
+
+
+
+```{r}
+results.models %>% filter(type == "loglik") %>% dplyr::select(family, otu, value) %>% mutate(value=round(as.numeric(value),2)) %>% pivot_wider(names_from=family, values_from=value) %>% arrange(otu)
+
+```
+```{r}
+results.models %>% filter(type == "loglik") %>% dplyr::select(family, otu, p_value) %>% mutate(p_value=round(p_value,6)) %>% pivot_wider(names_from=family, values_from=p_value) %>% arrange(otu)
+
+```
+
+
+```{r}
+pvals <- results.models %>% filter(type == "loglik") %>% 
+  mutate(y_true = as.factor(y_true)) %>%
+  dplyr::select(family, otu, p_value, y_true,) %>% 
+  pivot_wider(names_from=family, values_from=p_value)
+zero.values <- otu.table %>% 
+  gather(otu, value) %>% 
+  group_by(otu) %>% 
+  summarize(pct.nonzero = sum(value > 0)/n(), magnitude=mean(log(value+1)), variance=var(log(value+1)))
+pvals <- pvals %>% merge(zero.values)
+ggplot(pvals , aes(x=`ZINegativeBinomial`, y=`ZIBetaBinomial`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("ZI Negative Binomial and ZI Beta Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+Histogram of p-values
+
+```{r, fig.width=8,fig.height=8}
+pvals <- results.models %>% filter(type == "loglik") %>% 
+  mutate(y_true = as.factor(y_true), family = factor(family, levels=family.names))
+ggplot(pvals, aes(x=p_value)) + geom_histogram() + facet_wrap(~ family, ncol=2, scales="free")
+```
+
+
+## Computational problems?
+
+```{r}
+results.other <- list()
+```
+
+
+```{r}
+library(MASS)
+
+# Loop over OTUs in paraller
+results.model <- foreach (i=1:length(otu.names), .combine=rbind, .errorhandling='pass') %dopar% {
+  otu <- otu.names[[i]]
+  result <- tryCatch({
+    str.model <- models[["NegativeBinomial"]]
+    str.model0 <- str_replace(str.model, "Group +" , "")
+    eq1 <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+    eq2 <- as.formula(do.call("sprintf", as.list(c(str.model0, rep(otu, str_count(str.model, "%s"))))))
+    m1 <- glm.nb(eq1, data = otu.simulated)#, control=glm.control(maxit = 50)
+    m2 <- glm.nb(eq2, data = otu.simulated)#, control=glm.control(maxit = 50)
+    ll.1    <- m1$twologlik
+    ll.2    <- m2$twologlik
+    lr.df <- m2$df.residual - m1$df.residual
+    p.value.obs <- pchisq((ll.1 - ll.2), lr.df, lower.tail=F)
+    c(otu=otu, value=ll.1/2, convergence=m1$converged, p_value=p.value.obs, type="MASS")
+  }, error=function(e) {
+    c(otu=otu, value=NA, convergence=F, p_value=NA, type="MASS")
+  }, finally=function(e) {
+    c(otu=otu, value=NA, convergence=F, p_value=NA, type="MASS")
+  })
+  return(result)
+}
+
+# Save p-values from both log likelihood and prr-test
+results.model <- as.data.frame(results.model) %>% 
+  mutate(p_value = p_value %>% as.numeric %>% replace_na(1)) %>% 
+  inner_join(otu.true, by="otu") %>% 
+  mutate(y_pred = p_value <= 0.05)
+
+results.other[["NegativeBinomial"]] <- as.data.frame(results.model)
+
+```
+
+```{r}
+library(aod)
+
+# Loop over OTUs in paraller
+results.model <- foreach (i=1:length(otu.names), .combine=rbind, .errorhandling='pass') %dopar% {
+  otu <- otu.names[[i]]
+  result <- tryCatch({
+  str.model <- models[["BetaBinomial"]]
+  str.model0 <- str_replace(str.model, "Group +" , "1")
+  eq1 <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+  eq2 <- as.formula(do.call("sprintf", as.list(c(str.model0, rep(otu, str_count(str.model, "%s"))))))
+  m1 <- betabin(eq1, ~1, data = otu.simulated)
+  m2 <- betabin(eq2, ~1, data = otu.simulated)
+  ll.1    <- m1@logL
+  ll.2    <- m2@logL
+  lr.df <- m2@df.residual - m1@df.residual
+  p.value.obs <- pchisq(2 * (ll.1 - ll.2), lr.df, lower.tail=F)
+  p.value.obs
+
+    c(otu=otu, value=ll.1, convergence=F, p_value=p.value.obs, type="aod")
+  }, error=function(e) {
+    c(otu=otu, value=NA, convergence=F, p_value=NA, type="aod")
+  }, finally=function(e) {
+    c(otu=otu, value=NA, convergence=F, p_value=NA, type="aod")
+  })
+  return(result)
+}
+
+# Save p-values from both log likelihood and prr-test
+results.model <- as.data.frame(results.model) %>% 
+  mutate(p_value = p_value %>% as.numeric %>% replace_na(1)) %>% 
+  inner_join(otu.true, by="otu") %>% 
+  mutate(y_pred = p_value <= 0.05)
+
+results.other[["BetaBinomial"]] <- as.data.frame(results.model)
+
+
+```
+
+```{r}
+library(pscl)
+
+
+# Loop over OTUs in paraller
+results.model <- foreach (i=1:length(otu.names), .combine=rbind, .errorhandling='pass') %dopar% {
+  otu <- otu.names[[i]]
+  result <- tryCatch({
+  str.model <- models[["ZINegativeBinomial"]]
+  str.model0 <- str_replace_all(str.model, "Group +" , "1")
+  eq1 <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+  eq2 <- as.formula(do.call("sprintf", as.list(c(str.model0, rep(otu, str_count(str.model, "%s"))))))
+  m1 <- zeroinfl(eq1, data = otu.simulated, dist = "negbin")
+  m2 <- zeroinfl(eq2, data = otu.simulated, dist = "negbin")
+  ll.1    <- m1$loglik
+  ll.2    <- m2$loglik
+  lr.df <- m2$df.residual - m1$df.residual
+  p.value.obs <- pchisq(2 * (ll.1 - ll.2), lr.df, lower.tail=F)
+  p.value.obs
+    c(otu=otu, value=ll.1, convergence=F, p_value=p.value.obs, type="pscl")
+  }, error=function(e) {
+    c(otu=otu, value=NA, convergence=F, p_value=NA, type="pscl")
+  }, finally=function(e) {
+    c(otu=otu, value=NA, convergence=F, p_value=NA, type="pscl")
+  })
+  return(result)
+}
+
+# Save p-values from both log likelihood and prr-test
+results.model <- as.data.frame(results.model) %>% 
+  mutate(p_value = p_value %>% as.numeric %>% replace_na(1)) %>% 
+  inner_join(otu.true, by="otu") %>% 
+  mutate(y_pred = p_value <= 0.05)
+
+results.other[["ZINegativeBinomial"]] <- results.model
+```
+
+```{r}
+library(gamlss)
+
+# Loop over OTUs in paraller
+results.model <- foreach (i=1:length(otu.names), .combine=rbind, .errorhandling='pass') %dopar% {
+  otu <- otu.names[[i]]
+  result <- tryCatch({
+  str.model <- "%s/library_size ~ Group"
+  str.model0 <- "%s/library_size ~ 1"
+  eq1 <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+  eq2 <- as.formula(do.call("sprintf", as.list(c(str.model0, rep(otu, str_count(str.model, "%s"))))))
+  mod1<-gamlss(eq1, sigma.formula=~1, nu.formula=~Group, family=BEZI, data=otu.simulated, control=gamlss.control(trace=F)) 
+  mod2<-gamlss(eq2, sigma.formula=~1, nu.formula=~1, family=BEZI, data=otu.simulated, control=gamlss.control(trace=F)) 
+  ll.1 <- -mod1$P.deviance/2
+  ll.2 <- -mod2$P.deviance/2
+  lr.df <- mod2$df.residual - mod1$df.residual
+  p.value.obs <- pchisq(2 * (ll.1 - ll.2), lr.df, lower.tail=F)
+  p.value.obs
+    c(otu=otu, value=ll.1, convergence=F, p_value=p.value.obs, type="gamlss")
+  }, error=function(e) {
+    c(otu=otu, value=NA, convergence=F, p_value=NA, type="gamlss")
+  }, finally=function(e) {
+    c(otu=otu, value=NA, convergence=F, p_value=NA, type="gamlss")
+  })
+  return(result)
+}
+
+# Save p-values from both log likelihood and prr-test
+results.model <- as.data.frame(results.model) %>% 
+  mutate(p_value = p_value %>% as.numeric %>% replace_na(1)) %>% 
+  inner_join(otu.true, by="otu") %>% 
+  mutate(y_pred = p_value <= 0.05)
+
+results.other[["ZIBetaBinomial"]] <- results.model
+
+```
+
+```{r}
+results.other <-  bind_rows(results.other, .id = "family")
+# Calculate statistics for each experiment and display the mean
+results.other %>%
+  group_by(family,type) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) 
+```
+
+
+```{r}
+temp <- rbind(results.models, results.other)
+
+pvals <- temp %>% filter(family == "NegativeBinomial") %>% 
+  mutate(y_true = as.factor(y_true)) %>%
+  dplyr::select(family, otu, p_value, y_true, type) %>% 
+  pivot_wider(names_from=type, values_from=p_value)
+ggplot(pvals , aes(x=`loglik`, y=`MASS`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("Negative Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+```{r}
+pvals <- temp %>% filter(family == "BetaBinomial") %>% 
+  mutate(y_true = as.factor(y_true)) %>%
+  dplyr::select(family, otu, p_value, y_true, type) %>% 
+  pivot_wider(names_from=type, values_from=p_value)
+ggplot(pvals , aes(x=`loglik`, y=`aod`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("Beta Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+```{r}
+pvals <- temp %>% filter(family == "ZINegativeBinomial") %>% 
+  mutate(y_true = as.factor(y_true)) %>%
+  dplyr::select(family, otu, p_value, y_true, type) %>% 
+  pivot_wider(names_from=type, values_from=p_value)
+ggplot(pvals , aes(x=`loglik`, y=`pscl`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("ZI Negative Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+
+```{r}
+pvals <- temp %>% filter(family == "ZIBetaBinomial") %>% 
+  mutate(y_true = as.factor(y_true)) %>%
+  dplyr::select(family, otu, p_value, y_true, type) %>% 
+  pivot_wider(names_from=type, values_from=p_value)
+ggplot(pvals , aes(x=`loglik`, y=`gamlss`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("ZI Negative Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+
+```{r}
+family.take <- family.names[c(3,4,7,8)]
+pvals <- temp %>% filter(family %in% family.take) %>% 
+  mutate(y_true = as.factor(y_true),
+  family = factor(family, levels=family.take),
+  type = recode(type, `loglik`="loglik", `llperm`="llperm", `MASS`="alternative", `aod`="alternative",    `pscl`="alternative",   `gamlss`="alternative")) %>%
+  dplyr::select(family, otu, p_value, y_true, type) %>% 
+  pivot_wider(names_from=type, values_from=p_value)
+p1 <- ggplot(pvals , aes(x=`loglik`, y=`alternative`, color=y_true)) + 
+  geom_jitter(size=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("P-value: alternative libraries \n(MASS, pscl, aod, gamlss)") + facet_wrap(~family, ncol=2) #+theme(legend.position="bottom")
+ggsave("library_comparison.eps", height = 4.5 , width = 6.5, dpi=240)
+
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+## Parameters
+
+
+```{r}
+base <- c("(Intercept)", "Groupmeateater", "Groupvegan", "Groupvegetarian")
+params.names <- list(
+  Poisson = base,
+  Binomial = base,
+  NegativeBinomial = c(base, "theta"),
+  BetaBinomial = c(base, "theta"),
+  ZIPoisson = c(base, paste0("ZI.", base)),
+  ZIBinomial = c(base, paste0("ZI.", base)),
+  ZINegativeBinomial = c(base, paste0("ZI.", base), "theta"),
+  ZIBetaBinomial = c(base, paste0("ZI.", base), "theta")
+)
+
+# Loop over models
+results.models <- list()
+for (model in names(models)) {
+  print(model)
+  start <- Sys.time()
+  str.model <- models[[model]]
+  family <- get(model, mode = "function", envir = parent.frame())
+  
+  # Loop over OTUs in paraller
+  results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+    otu <- otu.names[[i]]
+    eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+    fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=0, family=family)
+    fit$fit$optim$par
+  }
+  results.model <- setNames(as.data.frame(results.model), params.names[[model]])
+  results.model$otu <- otu.names
+  
+  results.models[[model]] <- results.model
+  # Time per model
+  end <- Sys.time()
+  print(end-start)
+}
+results.models <- bind_rows(results.models, .id = "family") 
+```
+
+```{r fig.width=8,fig.height=6}
+params <- results.models %>% pivot_longer(!c(family,otu), names_to = "parameter", values_to = "value") %>% filter(otu %in% otu.names[1:6])
+ggplot(data=params, aes(x=parameter, y=value, fill=family)) + 
+  geom_bar(stat="identity", position=position_dodge()) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~otu, ncol=2)
+```
+
+
+```{r}
+results.others <- list()
+
+# Loop over OTUs in paraller
+results.other <- foreach (i=1:length(otu.names), .combine=rbind, .errorhandling='pass') %dopar% {
+  otu <- otu.names[[i]]
+  result <- tryCatch({
+    str.model <- models[["NegativeBinomial"]]
+    str.model <- str_replace_all(str.model, "Group +" , "1")
+    eq1 <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+    m1 <- glm.nb(eq1, data = otu.simulated)#, control=glm.control(maxit = 50)
+    c(m1$coefficients, m1$theta)
+  }, error=function(e) {
+    rep(NA, 5)
+  }, finally=function(e) {
+    rep(NA, 5)
+  })
+  return(result)
+}
+#results.other <- setNames(as.data.frame(results.other), params.names[["NegativeBinomial"]])
+results.other <- as.data.frame(results.other)
+results.other$theta <- log(results.other$V2)
+results.other$otu <- otu.names
+results.others[["NegativeBinomial"]] <- as.data.frame(results.other)
+results.others <-  bind_rows(results.others, .id = "family")
+
+```
+
+```{r}
+thetas <- bind_rows(list(loglik=results.models,MASS=results.others), .id="type")
+
+pvals <- thetas %>% filter(family == "NegativeBinomial") %>% 
+  dplyr::select(family,otu, type,theta) %>%
+  pivot_wider(names_from=type, values_from=theta) %>%
+  mutate(MASS=log(MASS))
+p2 <- ggplot(pvals , aes(x=`loglik`, y=`MASS`)) + 
+  geom_abline(intercept=0,slope=1, lty="solid", color='blue') + geom_jitter(size=0.2) + 
+  ggtitle("theta") + coord_fixed(ratio = 1)+
+  annotate("text", x=0, y=0, hjust = 1, vjust=-1, label = "Reference", color="blue")
+ggsave("theta_comparison.eps", height = 4.5 , width = 6.5, dpi=240)
+
+```
+
+
+```{r}
+ggarrange(p1+theme(legend.position="top"),p2, widths=c(2,1))
+ggsave("comp_comparison.eps", height = 4.5 , width = 6.5, dpi=240)
+
+```
+
+
+## Real data with likelihood models: no signal
+
+
+```{r}
+# This is the data.frame of simulated data and true answers
+otu.simulated <- otu.counts
+otu.simulated$Group <- sample(sample(c("meateater", "fisheater", "vegetarian", "vegan"), size=nrow(otu.counts), prob=c(0.25, 0.25, 0.25, 0.25), replace=T))
+otu.true <- data.frame(otu=otu.names, y_true=as.integer(otu.names %in% sample(otu.names, 178, replace=F)))
+  
+```
+
+```{r}
+# Loop over models
+results.models <- list()
+for (model in names(models)) {
+  print(model)
+  start <- Sys.time()
+  str.model <- models[[model]]
+  family <- get(model, mode = "function", envir = parent.frame())
+  
+  # Loop over OTUs in paraller
+  results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+    otu <- otu.names[[i]]
+    eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+    fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=0, family=family)
+    c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim, value=fit$fit$optim$value, 
+      convergence=fit$fit$optim$convergence, message=fit$fit$optim$message)
+  }
+  # Save p-values from both log likelihood and prr-test
+  results.model <- as.data.frame(results.model) %>% 
+    mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+    inner_join(otu.true, by="otu") %>% 
+    pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+    mutate(y_pred = p_value <= 0.05)
+  
+  results.models[[model]] <- results.model
+  # Time per model
+  end <- Sys.time()
+  print(end-start)
+}
+results.models <- bind_rows(results.models, .id = "family") 
+
+```
+
+```{r}
+# Calculate statistics for each experiment and display the mean
+results.models %>% filter(type == "loglik") %>%
+  group_by(family,type) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) 
+```
+
+```{r}
+results.models %>% filter(type == "loglik") %>% dplyr::select(family, otu, value) %>% mutate(value=round(as.numeric(value),2)) %>% pivot_wider(names_from=family, values_from=value) %>% arrange(otu)
+```
+
+```{r}
+results.models %>% filter(type == "loglik") %>% dplyr::select(family, otu, p_value) %>% mutate(p_value=round(p_value,6)) %>% pivot_wider(names_from=family, values_from=p_value) %>% arrange(otu)
+
+```
+
+
+```{r}
+pvals <- results.models %>% filter(type == "loglik") %>% 
+  mutate(y_true = as.factor(y_true)) %>%
+  dplyr::select(family, otu, p_value, y_true,) %>% 
+  pivot_wider(names_from=family, values_from=p_value)
+zero.values <- otu.table %>% 
+  gather(otu, value) %>% 
+  group_by(otu) %>% 
+  summarize(pct.nonzero = sum(value > 0)/n(), magnitude=mean(log(value+1)), variance=var(log(value+1)))
+pvals <- pvals %>% merge(zero.values)
+ggplot(pvals , aes(x=`ZINegativeBinomial`, y=`ZIBetaBinomial`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("ZI Negative Binomial and ZI Beta Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+Histogram of p-values
+
+```{r, fig.width=8,fig.height=8}
+pvals <- results.models %>% filter(type == "loglik") %>% 
+  mutate(y_true = as.factor(y_true), family = factor(family, levels=family.names))
+ggplot(pvals, aes(x=p_value)) + geom_histogram() + facet_wrap(~ family, ncol=2, scales="free")
+```
+
+
+
+## Functions to simulate from Zero-Inflated Negative Binomial
+
+```{r}
+library(pscl)
+library(MASS)
+
+# Given a data frame of OTU counts and columns, calculate zero-inflated negative binomial parameters
+zinb_parameters <- function(otu.counts, otu.names) {
+  parameters <- list()
+  for (otu in otu.names) {
+    if (all(otu.counts[[otu]] > 0)) {
+      fit <- glm.nb(get(otu) ~ 1, data=otu.counts)
+      alpha = fit$coefficients[["(Intercept)"]]
+      beta = NA
+      theta = fit$theta
+    } else {
+      fit <- zeroinfl(get(otu) ~ 1 | 1, data = otu.counts, dist = "negbin", EM = F)
+      alpha = fit$coefficients$count[["(Intercept)"]]
+      beta = fit$coefficients$zero[["(Intercept)"]]
+      theta = fit$theta
+    }
+    parameters[[otu]] <- c(alpha=alpha, beta=beta, theta=theta)
+  }
+  parameters <- data.frame(parameters)
+  return(parameters)
+}
+```
+
+
+```{r}
+# Generate simulated signal from strata defined by a combination of features, 
+# each feature value makes 10% of OTUs independently differentially abundant
+generate_signal <- function (strata, sample.size, otu.names, effect=log(2)) {
+  # Randomly sample a data frame of features from a given strata definition
+  idx <- sample(1:nrow(strata), sample.size, replace=T, prob=strata$Probability)
+  df.features <- strata[idx,]
+  features <- colnames(strata)[colnames(strata) != "Probability"]
+  # Loop over different features that define a strata
+  diff.abundant <- list()
+  for (feature in features) {
+    # For every feature value, randomly sample 10% of OTUs differentially abundant
+    diff.abundant.value <- list()
+    values <- unique(df.features[[feature]])
+    for (value in values){
+      diff.abundant.value[[value]] <- sample(otu.names, length(otu.names)/10)
+    }
+    diff.abundant[[feature]] <- diff.abundant.value
+  }
+  # Define effects X
+  X <- array(0, c(sample.size,length(otu.names)), list(1:sample.size, otu.names))
+  # Loop over every person and define their OTU effect  
+  for (i in 1:sample.size) {
+    person <- df.features[i,]
+    for (feature in names(diff.abundant)) {
+      otus <- diff.abundant[[feature]][[person[[feature]]]]
+      X[i, otus] = X[i, otus] + effect
+    }
+  }
+  # These OTUs are truly differentially abundant (affected by Group)
+  diff.abundant <- unique(unlist(diff.abundant$Group))
+  return(list(df.effects=X, df.features=df.features, diff.abundant=diff.abundant))
+}
+```
+
+```{r}
+# Given zero-inflated negative binomial parameters and sample size, create a simulated data set
+zinb_simulate <- function(parameters, sample.size, strata=NULL, effect=log(2)) {
+  otu.names <- colnames(parameters)
+  # Whether there is strata that defines any signal, i.e. differentially abundant OTUs
+  if (!is.null(strata))
+      signal <- generate_signal(strata, sample.size, otu.names, effect)
+  # Generate OTU counts
+  otu.simulated <- list()
+  for (otu in otu.names) {
+    params <- parameters[[otu]]
+    alpha <- params[1]
+    beta <- params[2]
+    theta <- params[3]
+    otu.effect = if (!is.null(strata)) signal$df.effects[,otu] else 0 # This is the 'signal'
+    is.zero = if (!is.na(beta)) rbinom(sample.size, size=1, prob=1/(1+exp(-beta + otu.effect))) else rep(0,sample.size)
+    count.nonzero = rnbinom(sample.size, size=theta, mu=exp(alpha + otu.effect))
+    otu.simulated[[otu]] = ifelse(is.zero, 0, count.nonzero)
+  }
+  otu.simulated <- data.frame(otu.simulated)
+  # Add features if relevant
+  if (!is.null(strata)) {
+    otu.simulated$library_size <- rowSums(otu.simulated)
+    otu.simulated <- data.frame(otu.simulated, signal$df.features)
+  }
+  return(list(X=otu.simulated, 
+              y=if (!is.null(strata)) signal$diff.abundant else NULL))
+}
+```
+
+Find distribution parameters by fitting it to each taxa in real data
+
+```{r}
+# Fit ZIBN to real data
+parameters <- zinb_parameters(otu.counts, otu.names)
+```
+
+Generate the 'signal' by defining artificial covariates and sampling from the distribution:
+
+```{r}
+# Specify a bivariate distribution
+strata <- data.frame(Group = c("meateater", "fisheater", "vegetarian", "vegan"), 
+                     Probability=c(0.25, 0.25, 0.25, 0.25))
+# Create simulated data
+data <- zinb_simulate(parameters, sample.size=nrow(otu.counts), strata=strata, effect=log(2))
+otu.simulated <- data$X
+otu.true <- data.frame(otu=otu.names, y_true=otu.names %in% data$y %>% as.integer)
+```
+
+```{r}
+# Loop over models
+results.models <- list()
+for (model in names(models)) {
+  print(model)
+  start <- Sys.time()
+  str.model <- models[[model]]
+  family <- get(model, mode = "function", envir = parent.frame())
+  
+  # Loop over OTUs in paraller
+  results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+    otu <- otu.names[[i]]
+    eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+    fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=0, family=family)
+    c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim, value=fit$fit$optim$value, 
+      convergence=fit$fit$optim$convergence, message=fit$fit$optim$message)
+  }
+  # Save p-values from both log likelihood and prr-test
+  results.model <- as.data.frame(results.model) %>% 
+    mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+    inner_join(otu.true, by="otu") %>% 
+    pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+    mutate(y_pred = p_value <= 0.05)
+  
+  results.models[[model]] <- results.model
+  # Time per model
+  end <- Sys.time()
+  print(end-start)
+}
+results.models <- bind_rows(results.models, .id = "family") 
+
+```
+
+```{r}
+# Calculate statistics for each experiment and display the mean
+results.models %>% filter(type == "loglik") %>%
+  group_by(family,type) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) 
+```
+
+```{r}
+pvals <- results.models %>% filter(type == "loglik") %>% 
+  mutate(y_true = as.factor(y_true)) %>%
+  dplyr::select(family, otu, p_value, y_true) %>% 
+  pivot_wider(names_from=family, values_from=p_value)
+zero.values <- otu.table %>% 
+  gather(otu, value) %>% 
+  group_by(otu) %>% 
+  summarize(pct.nonzero = sum(value > 0)/n(), magnitude=mean(log(value+1)), variance=var(log(value+1)))
+pvals <- pvals %>% merge(zero.values)
+ggplot(pvals , aes(x=`NegativeBinomial`, y=`BetaBinomial`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("Negative Binomial and Beta Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+
+```{r}
+pvals <- results.models %>% filter(type == "loglik") %>% 
+  mutate(y_true = as.factor(y_true)) %>%
+  dplyr::select(family, otu, p_value, y_true) %>% 
+  pivot_wider(names_from=family, values_from=p_value)
+zero.values <- otu.table %>% 
+  gather(otu, value) %>% 
+  group_by(otu) %>% 
+  summarize(pct.nonzero = sum(value > 0)/n(), magnitude=mean(log(value+1)), variance=var(log(value+1)))
+pvals <- pvals %>% merge(zero.values)
+ggplot(pvals , aes(x=`ZINegativeBinomial`, y=`ZIBetaBinomial`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("ZI Negative Binomial and ZI Beta Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+Histogram of p-values
+
+```{r, fig.width=8,fig.height=8}
+pvals <- results.models %>% filter(type == "loglik") %>% 
+  mutate(y_true = as.factor(y_true), family = factor(family, levels=family.names))
+ggplot(pvals, aes(x=p_value)) + geom_histogram() + facet_wrap(~ family, ncol=2, scales="free")
+```
+
+## Functions to simulate from Negative Binomial
+
+```{r}
+# Given a data frame of OTU counts and columns, calculate zero-inflated negative binomial parameters
+nb_parameters <- function(otu.counts, otu.names) {
+  parameters <- list()
+  for (otu in otu.names) {
+      fit <- glm.nb(get(otu) ~ 1, data=otu.counts)
+      alpha = fit$coefficients[["(Intercept)"]]
+      beta = NA
+      theta = fit$theta
+    parameters[[otu]] <- c(alpha=alpha, beta=beta, theta=theta)
+  }
+  parameters <- data.frame(parameters)
+  return(parameters)
+}
+```
+
+```{r}
+# Given zero-inflated negative binomial parameters and sample size, create a simulated data set
+nb_simulate <- function(parameters, sample.size, strata=NULL, effect=log(2)) {
+  otu.names <- colnames(parameters)
+  # Whether there is strata that defines any signal, i.e. differentially abundant OTUs
+  if (!is.null(strata))
+      signal <- generate_signal(strata, sample.size, otu.names, effect)
+  # Generate OTU counts
+  otu.simulated <- list()
+  for (otu in otu.names) {
+    params <- parameters[[otu]]
+    alpha <- params[1]
+    beta <- params[2]
+    theta <- params[3]
+    otu.effect = if (!is.null(strata)) signal$df.effects[,otu] else 0 # This is the 'signal'
+    otu.simulated[[otu]] = rnbinom(sample.size, size=theta, mu=exp(alpha + otu.effect))
+  }
+  otu.simulated <- data.frame(otu.simulated)
+  # Add features if relevant
+  if (!is.null(strata)) {
+    otu.simulated$library_size <- rowSums(otu.simulated)
+    otu.simulated <- data.frame(otu.simulated, signal$df.features)
+  }
+  return(list(X=otu.simulated, 
+              y=if (!is.null(strata)) signal$diff.abundant else NULL))
+}
+```
+
+Find distribution parameters by fitting it to each taxa in real data
+
+```{r warning=F}
+# Fit NB to real data
+parameters <- nb_parameters(otu.counts, otu.names)
+```
+
+```{r}
+parameters["theta",parameters["theta",] < 0.01] <- 0.01
+parameters["theta",parameters["theta",] > 1] <- 1
+```
+
+
+Generate the 'signal' by defining artificial covariates and sampling from the distribution:
+
+```{r}
+# Specify a bivariate distribution
+strata <- data.frame(Group = c("meateater", "fisheater", "vegetarian", "vegan"), 
+                     Probability=c(0.25, 0.25, 0.25, 0.25))
+# Create simulated data
+data <- nb_simulate(parameters, sample.size=nrow(otu.counts), strata=strata, effect=log(2))
+otu.simulated <- data$X
+otu.true <- data.frame(otu=otu.names, y_true=otu.names %in% data$y %>% as.integer)
+```
+
+```{r}
+# Loop over models
+results.models <- list()
+for (model in names(models)) {
+  print(model)
+  start <- Sys.time()
+  str.model <- models[[model]]
+  family <- get(model, mode = "function", envir = parent.frame())
+  
+  # Loop over OTUs in paraller
+  results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+    otu <- otu.names[[i]]
+    eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+    fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=0, family=family)
+    c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim, value=fit$fit$optim$value, 
+      convergence=fit$fit$optim$convergence, message=fit$fit$optim$message)
+  }
+  # Save p-values from both log likelihood and prr-test
+  results.model <- as.data.frame(results.model) %>% 
+    mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+    inner_join(otu.true, by="otu") %>% 
+    pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+    mutate(y_pred = p_value <= 0.05)
+  
+  results.models[[model]] <- results.model
+  # Time per model
+  end <- Sys.time()
+  print(end-start)
+}
+results.models <- bind_rows(results.models, .id = "family") 
+```
+
+
+```{r}
+# Calculate statistics for each experiment and display the mean
+results.models %>% filter(type == "loglik") %>%
+  group_by(family,type) %>% 
+  group_modify(~ simple_stats(.x$y_true, .x$p_value)) 
+```
+
+```{r}
+pvals <- results.models %>% filter(type == "loglik") %>% 
+  mutate(y_true = as.factor(y_true)) %>%
+  dplyr::select(family, otu, p_value, y_true) %>% 
+  pivot_wider(names_from=family, values_from=p_value)
+zero.values <- otu.table %>% 
+  gather(otu, value) %>% 
+  group_by(otu) %>% 
+  summarize(pct.nonzero = sum(value > 0)/n(), magnitude=mean(log(value+1)), variance=var(log(value+1)))
+pvals <- pvals %>% merge(zero.values)
+ggplot(pvals , aes(x=`NegativeBinomial`, y=`BetaBinomial`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("Negative Binomial and Beta Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+
+```{r}
+pvals <- results.models %>% filter(type == "loglik") %>% 
+  mutate(y_true = as.factor(y_true)) %>%
+  dplyr::select(family, otu, p_value, y_true) %>% 
+  pivot_wider(names_from=family, values_from=p_value)
+zero.values <- otu.table %>% 
+  gather(otu, value) %>% 
+  group_by(otu) %>% 
+  summarize(pct.nonzero = sum(value > 0)/n(), magnitude=mean(log(value+1)), variance=var(log(value+1)))
+pvals <- pvals %>% merge(zero.values)
+ggplot(pvals , aes(x=`ZINegativeBinomial`, y=`ZIBetaBinomial`, color=y_true)) + 
+  geom_jitter(size=1,alpha=0.2) +coord_fixed(ratio = 1, xlim = c(-0,1), ylim = c(-0,1)) +
+  ggtitle("ZI Negative Binomial and ZI Beta Binomial p-value comparison")
+#geom_jitter(width = 0.05, height=0.05)+coord_fixed(ratio = 1, xlim = c(-0.1,1.1), ylim = c(-0.1,1.1))
+```
+
+Histogram of p-values
+
+```{r, fig.width=8,fig.height=8}
+pvals <- results.models %>% filter(type == "loglik") %>% 
+  mutate(y_true = as.factor(y_true), family = factor(family, levels=family.names))
+ggplot(pvals, aes(x=p_value)) + geom_histogram() + facet_wrap(~ family, ncol=2, scales="free")
+```
+
+
+
+
+
+
+
+
+
+
+
+## Finally
+
+```{r}
+stopImplicitCluster()
+
+```
+

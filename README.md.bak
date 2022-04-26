@@ -30,7 +30,7 @@ See the 'vignettes' folder. We have two vignettes:
 
 Experiments for the paper can be found in 
 1. 'llperm_experiments.Rmd': shows how to run all experiments in a local machine, save the results and then visualize the tables & figures.
-2. 'llperm_experiments_LSF.Rmd': shows how to run the same experiments in a high-performance LSF cluster called 'biogrid' at RIVM, faster.
+2. 'llperm_experiments_LSF.Rmd': shows how to run the same experiments in a high-performance LSF cluster called 'biogrid' at RIVM.
 3. 'llperm_investigation.Rmd': some codes when we investigated why Beta Binomial / Negative Binomial differ and MASS had different results.
 
 # License

@@ -19,6 +19,7 @@ library(dplyr)
 library(tidyr)
 library(stringr)
 library(RColorBrewer)
+library(ggpubr)
 ```
 
 Use parallel processing (optional).
@@ -26,7 +27,7 @@ Use parallel processing (optional).
 ```{r}
 library(foreach)
 library(doParallel)
-numCores <- 16 #detectCores()
+numCores <- 10 #detectCores()
 registerDoParallel(numCores)
 ```
 
@@ -116,28 +117,30 @@ simple_roc <- function(labels, scores){
 # Simple ROC curve calculation (with interpolation)
 simple_roc2 <- function(labels, scores, FPR.out=seq(0.00,1.00,0.01)){
   labels <- labels[order(scores, decreasing=TRUE)]
-  temp <- data.frame(x=cumsum(labels)/sum(labels), 
-                     y=cumsum(!labels)/sum(!labels))
+  temp <- data.frame(TPR=cumsum(labels)/sum(labels), 
+                     FPR=cumsum(!labels)/sum(!labels))
   if (!is.null(FPR.out)) 
-    temp <- suppressWarnings(approx(temp$x, temp$y, xout=FPR.out, yleft=0, yright=1))
-  data.frame(TPR=temp$x, FPR=temp$y)
+    temp <- suppressWarnings(approx(temp$FPR, temp$TPR, xout=FPR.out, yleft=0, yright=1))
+  data.frame(FPR=temp$x, TPR=temp$y)
 }
 
 # Simple statistics calculation
-simple_stats <- function(labels, scores, threshold=0.05, decreasing=FALSE){
+simple_stats <- function(labels, scores, threshold=0.05, threshold.auc=0.10, decreasing=FALSE){
   labels <- labels[order(scores, decreasing=decreasing)]
   scores <- scores[order(scores, decreasing=decreasing)]
-  # Calculate AUC
-  AUC <- 1 - sum(labels * cumsum(!labels)) / (sum(!labels) * sum(labels))
-  # Calculate Power at a given False Discovery Rate (FDR)
+  # Calculate AUC 1 - sum(labels * cumsum(!labels)) / (sum(!labels) * sum(labels))
+  AUC <- sum(labels * (sum(!labels) - cumsum(!labels))) / (sum(!labels) * sum(labels))
   TPR <- cumsum(labels)/sum(labels)
   FPR <- cumsum(!labels)/sum(!labels)
-  PowerAt <- TPR[which.min(abs(FPR - threshold))]
+  # Calculate Power at a given False Discovery Rate (FDR) idx <- which.min(abs(FPR - threshold)) 
+  PowerAt <- TPR[(1:length(labels))[(FPR - threshold) >= 0][1]]
+  idx <- (1:length(labels))[(FPR - threshold.auc) >= 0][1]
+  AUCAt <- sum(labels[1:idx] * (sum(!labels[1:idx]) - cumsum(!labels[1:idx]))) / (sum(!labels[1:idx]) * sum(labels[1:idx]))
   # Calculate Power = TP/P and FDR = FP/N
   labels_pred <- if (decreasing) scores > threshold else scores <= threshold
   Power   <- sum(labels_pred & labels)/sum(labels)
   FPR     <- sum(labels_pred & !labels)/sum(!labels)
-  results <- data.frame(AUC=AUC, PowerAt=PowerAt, Power=Power, FPR=FPR)
+  results <- data.frame(AUC=AUC, PowerAt=PowerAt, AUCAt=AUCAt, Power=Power, FPR=FPR)
   return(results)
 }
 ```
@@ -184,7 +187,7 @@ with(otu.counts, print(sprintf("%.2f, %.2f", mean(ASV305), var(ASV305))))
 
 ```{r}
 set.seed(42)
-n.simulations <- 25 # simulate data and repeat the experiments n times to reduce sampling variance
+n.simulations <- 50 # simulate data and repeat the experiments n times to reduce sampling variance
 effects <- c(1.25, 1.5, 2.0, 3.0, 5.0) # multiply counts by effect, i.e. +25%, +50%, +100%, +200%, +400% 
 
 model.names <- c("Poisson", "ZIPoisson", "NegativeBinomial", "ZINegativeBinomial", 
@@ -241,7 +244,7 @@ diff.abundant <- list(
 Experiment:
 
 ```{r}
-fn <- "results.csv"
+fn <- "results_group_count.csv"
 if (file.exists(fn))
 	file.remove(fn)
 
@@ -334,18 +337,21 @@ for (i in 1:n.simulations) {
     results <- rbind(results.tests, results.models)
     results$effect <- effect
     results$experiment <- i
-    suppressWarnings({write.table(results, fn, sep=";", dec=",", append=T, col.names=(i==1) & (effect==effects[[1]]), row.names=F)})
+    suppressWarnings({write.table(results, fn, sep=";", dec=",", append=T, col.names=F, row.names=F)})
   }
 }
 
 ```
 
 ```{r}
-results <- read.table(file="results.csv", sep=";", dec=",", header = T)
+results <- read.table(file="results_group_count.csv", sep=";", dec=",", header = F)
+colnames(results) <- c("family","otu","y_true","type","p_value","y_pred","effect","experiment")
 results <- subset(results, subset = !(family %in% c("oneway_test", "kruskal_test")))
 # Combine model and p-value calculation method into a single factor
 results$model <- factor(paste0(sprintf("%s (%s)", results$family, results$type)), levels=model.names)
 ```
+
+
 
 Table with effect +100%:
 
@@ -357,19 +363,25 @@ stats <- results.1 %>%
   group_by(experiment, model) %>% 
   group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
   group_by(model) %>%
-  summarize(AUC.avg     = round(mean(AUC), 2), 
-            AUC.sd      = round(sd(AUC)/sqrt(n.simulations), 2), 
-            Power.avg   = round(mean(Power), 2), 
+  summarize(AUC.avg     = mean(AUC), 
+            AUC.sd    = round(sd(AUC)/sqrt(n.simulations), 2), 
+            Power.avg   = mean(Power), 
             Power.sd    = round(sd(Power)/sqrt(n.simulations), 2), 
-            FPR.avg     = round(mean(FPR), 2),
-            FPR.sd      = round(sd(FPR)/sqrt(n.simulations), 2)) %>%
-            #PowerAt.avg = round(mean(PowerAt), 2),
-            #PowerAt.sd  = round(sd(PowerAt), 2)) %>%
-  transmute(model=model,
-    AUC   = paste(AUC.avg, sprintf("($\\pm%.2f$)", AUC.sd)),
-    Power = paste(Power.avg, sprintf("($\\pm%.2f$)", Power.sd)),
-    FPR   = paste(FPR.avg, sprintf("($\\pm%.2f$)", FPR.sd)))
-write.csv(stats, "stats.csv", row.names=F)
+            FPR.avg     = mean(FPR),
+            FPR.sd    = round(sd(FPR)/sqrt(n.simulations), 2), 
+            PowerAt.avg = mean(PowerAt),
+            PowerAt.sd    = round(sd(PowerAt)/sqrt(n.simulations), 2), 
+            AUCAt.avg   = mean(AUCAt),
+            AUCAt.sd    = round(sd(AUCAt)/sqrt(n.simulations), 2)) %>%
+  mutate(across(where(is.numeric), round, 2)) %>% separate(model, c("Family", "Type"), sep=" ") %>%
+  transmute(Family=Family, Type=Type,
+    #AUC   = sprintf("%.2f ($\\pm%.2f$)", AUC.avg, AUC.sd),
+    Power = sprintf("%.2f ($\\pm%.2f$)", Power.avg, Power.sd),
+    FPR   = sprintf("%.2f ($\\pm%.2f$)", FPR.avg, FPR.sd),
+    PowerAt = sprintf("%.2f ($\\pm%.2f$)", PowerAt.avg, PowerAt.sd),
+    AUCAt   = sprintf("%.2f ($\\pm%.2f$)", AUCAt.avg, AUCAt.sd))  %>%
+  rename("Power"="Power", "FPR"="FPR", "Power@0.05"="PowerAt", "AUC@0.10"="AUCAt")
+write.table(stats, "stats_group_count.csv", row.names=F, sep=";", dec=",")
 print.data.frame(stats)
 ```
 
@@ -383,39 +395,29 @@ stats <- results.2 %>%
   group_by(experiment, model, effect) %>% 
   group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
   group_by(model, effect) %>%
-  summarize(AUC     = round(mean(AUC), 2), 
-            Power   = round(mean(Power), 2), 
-            FPR     = round(mean(FPR), 2)) %>%
-  pivot_longer(c(AUC, Power, FPR), names_to = "metric", values_to = "value") %>% 
-  mutate(family = recode(model, !!!model.family))
+  summarize(AUC     = mean(AUC), 
+            Power   = mean(Power), 
+            FPR     = mean(FPR), 
+            PowerAt     = mean(PowerAt), 
+            AUCAt     = mean(AUCAt)) %>%
+  pivot_longer(c(AUC, Power, FPR, PowerAt, AUCAt), names_to = "metric", values_to = "value") %>% 
+  mutate(family = recode(model, !!!model.family)) %>% 
+  filter(metric %in% c("Power", "FPR", "PowerAt", "AUCAt")) %>%
+  mutate(metric = factor(metric, levels = c("Power", "FPR", "PowerAt", "AUCAt")))%>% 
+  mutate(metric = recode_factor(metric, Power="Power", FPR="FPR", PowerAt="Power@0.05", AUCAt="AUC@0.10"))
 
 # Plot statistics for each effect size
-ggplot(stats, aes(x=effect, y=value, col=model, linetype=model)) + 
+p1 <- ggplot(stats, aes(x=effect, y=value, col=model, linetype=model)) + 
   geom_line() +
   scale_linetype_manual(values = rep(c("dashed", "solid"), length.out=16)) +
   scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
   facet_grid(family ~ metric) + theme_bw() + #xlab("log(effect)")
-  labs(title="Metrics as a function of effect size", x="Effect size", y="value") +
+  labs(title="Signal in counts: Metrics as a function of effect size", x="Effect size", y="value") +
   scale_x_continuous(trans="log", breaks=c(25, 50, 100, 200, 400), labels=paste0("+",c(25, 50, 100, 200, 400), "%")) + 
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-ggsave("metrics.eps", height = 4.5 , width = 6.5, dpi=240)
-```
-
-```{r}
-# Calculate ROC with confidence intervals
-roc <- results.1 %>%
-  group_by(experiment, model) %>%
-  group_modify(~ simple_roc2(.x$y_true, 1-.x$p_value)) %>%
-  group_by(model, TPR) %>%
-  summarize(FPR.mean=mean(FPR))%>% 
-  mutate(family = recode(model, !!!model.family))
-# Plot
-ggplot(roc, aes(x=FPR.mean, y=TPR, col=model, linetype=model)) +
-  geom_step() +
-  scale_linetype_manual(values = rep(c("solid", "dashed"), length.out=16)) +
-  scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
-  labs(title="ROC curve", x="FPR", "TPR") + theme_bw() + facet_grid(family ~ .)
-ggsave("roc.eps", height = 4.5 , width = 6.5, dpi=240)
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), 
+        legend.text = element_text(size=10),  #      legend.title = element_blank(), 
+        legend.position="bottom")
+ggsave("metrics_group_count.eps", height = 5.25 , width = 6.75, dpi=240)
 ```
 
 ### Signal in counts + zeros
@@ -423,7 +425,7 @@ ggsave("roc.eps", height = 4.5 , width = 6.5, dpi=240)
 Experiment:
 
 ```{r}
-fn <- "results_both.csv"
+fn <- "results_group_both.csv"
 if (file.exists(fn))
 	file.remove(fn)
 
@@ -516,7 +518,7 @@ for (i in 1:n.simulations) {
     results <- rbind(results.tests, results.models)
     results$effect <- effect
     results$experiment <- i
-    suppressWarnings({write.table(results, fn, sep=";", dec=",", append=T, col.names=(i==1) & (effect==effects[[1]]), row.names=F)})
+    suppressWarnings({write.table(results, fn, sep=";", dec=",", append=T, col.names=F, row.names=F)})
   }
 }
 
@@ -524,11 +526,11 @@ for (i in 1:n.simulations) {
 
 
 ```{r}
-results <- read.table(file="results_both.csv", sep=";", dec=",", header = T)
+results <- read.table(file="results_group_both.csv", sep=";", dec=",", header = F)
+colnames(results) <- c("family","otu","y_true","type","p_value","y_pred","effect","experiment")
 results <- subset(results, subset = !(family %in% c("oneway_test", "kruskal_test")))
 # Combine model and p-value calculation method into a single factor
 results$model <- factor(paste0(sprintf("%s (%s)", results$family, results$type)), levels=model.names)
-
 ```
 
 Table with effect +100%:
@@ -541,23 +543,28 @@ stats <- results.1 %>%
   group_by(experiment, model) %>% 
   group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
   group_by(model) %>%
-  summarize(AUC.avg     = round(mean(AUC), 2), 
-            AUC.sd      = round(sd(AUC)/sqrt(n.simulations), 2), 
-            Power.avg   = round(mean(Power), 2), 
+  summarize(#AUC.avg     = mean(AUC), 
+            #AUC.sd    = round(sd(AUC)/sqrt(n.simulations), 2), 
+            Power.avg   = mean(Power), 
             Power.sd    = round(sd(Power)/sqrt(n.simulations), 2), 
-            FPR.avg     = round(mean(FPR), 2),
-            FPR.sd      = round(sd(FPR)/sqrt(n.simulations), 2)) %>%
-            #PowerAt.avg = round(mean(PowerAt), 2),
-            #PowerAt.sd  = round(sd(PowerAt), 2)) %>%
-  transmute(model=model,
-    AUC   = paste(AUC.avg, sprintf("($\\pm%.2f$)", AUC.sd)),
-    Power = paste(Power.avg, sprintf("($\\pm%.2f$)", Power.sd)),
-    FPR   = paste(FPR.avg, sprintf("($\\pm%.2f$)", FPR.sd)))
-write.csv(stats, "stats_both.csv", row.names=F)
+            FPR.avg     = mean(FPR),
+            FPR.sd    = round(sd(FPR)/sqrt(n.simulations), 2), 
+            PowerAt.avg = mean(PowerAt),
+            PowerAt.sd    = round(sd(PowerAt)/sqrt(n.simulations), 2), 
+            AUCAt.avg   = mean(AUCAt),
+            AUCAt.sd    = round(sd(AUCAt)/sqrt(n.simulations), 2)) %>%
+  mutate(across(where(is.numeric), round, 2)) %>% separate(model, c("Family", "Type"), sep=" ") %>%
+  transmute(Family=Family, Type=Type,
+    #AUC   = sprintf("%.2f ($\\pm%.2f$)", AUC.avg, AUC.sd),
+    Power = sprintf("%.2f ($\\pm%.2f$)", Power.avg, Power.sd),
+    FPR   = sprintf("%.2f ($\\pm%.2f$)", FPR.avg, FPR.sd),
+    PowerAt = sprintf("%.2f ($\\pm%.2f$)", PowerAt.avg, PowerAt.sd),
+    AUCAt   = sprintf("%.2f ($\\pm%.2f$)", AUCAt.avg, AUCAt.sd)) %>%
+  rename("Power"="Power", "FPR"="FPR", "Power@0.05"="PowerAt", "AUC@0.10"="AUCAt")
+write.table(stats, "stats_group_both.csv", row.names=F, sep=";", dec=",")
 print.data.frame(stats)
 ```
 
-Plot with effect sizes +25%, ..., +400%:
 
 ```{r}
 results.2 <- results %>% mutate(effect=(effect-1)*100) # results.2 <- results %>% mutate(effect=(exp(effect)-1)*100)
@@ -567,39 +574,35 @@ stats <- results.2 %>%
   group_by(experiment, model, effect) %>% 
   group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
   group_by(model, effect) %>%
-  summarize(AUC     = round(mean(AUC), 2), 
-            Power   = round(mean(Power), 2), 
-            FPR     = round(mean(FPR), 2)) %>%
-  pivot_longer(c(AUC, Power, FPR), names_to = "metric", values_to = "value") %>% 
-  mutate(family = recode(model, !!!model.family))
+  summarize(AUC     = mean(AUC), 
+            Power   = mean(Power), 
+            FPR     = mean(FPR), 
+            PowerAt     = mean(PowerAt), 
+            AUCAt     = mean(AUCAt)) %>%
+  pivot_longer(c(AUC, Power, FPR, PowerAt, AUCAt), names_to = "metric", values_to = "value") %>% 
+  mutate(family = recode(model, !!!model.family)) %>% 
+  filter(metric %in% c("Power", "FPR", "PowerAt", "AUCAt")) %>%
+  mutate(metric = factor(metric, levels = c("Power", "FPR", "PowerAt", "AUCAt"))) %>% 
+  mutate(metric = recode_factor(metric, Power="Power", FPR="FPR", PowerAt="Power@0.05", AUCAt="AUC@0.10"))
 
 # Plot statistics for each effect size
-ggplot(stats, aes(x=effect, y=value, col=model, linetype=model)) + 
+p2 <- ggplot(stats, aes(x=effect, y=value, col=model, linetype=model)) + 
   geom_line() +
   scale_linetype_manual(values = rep(c("dashed", "solid"), length.out=16)) +
   scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
   facet_grid(family ~ metric) + theme_bw() + #xlab("log(effect)")
-  labs(title="Metrics as a function of effect size", x="Effect size", y="value") +
+  labs(title="Signal in counts and zeros: Metrics as a function of effect size", x="Effect size", y="value") +
   scale_x_continuous(trans="log", breaks=c(25, 50, 100, 200, 400), labels=paste0("+",c(25, 50, 100, 200, 400), "%")) + 
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-ggsave("metrics_both.eps", height = 4.5 , width = 6.5, dpi=240)
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), 
+        legend.text = element_text(size=10),  #      legend.title = element_blank(), 
+        legend.position="bottom")
+ggsave("metrics_group_both.eps", height = 5.25 , width = 6.75, dpi=240)
 ```
 
+
 ```{r}
-# Calculate ROC with confidence intervals
-roc <- results.1 %>%
-  group_by(experiment, model) %>%
-  group_modify(~ simple_roc2(.x$y_true, 1-.x$p_value)) %>%
-  group_by(model, TPR) %>%
-  summarize(FPR.mean=mean(FPR))%>% 
-  mutate(family = recode(model, !!!model.family))
-# Plot
-ggplot(roc, aes(x=FPR.mean, y=TPR, col=model, linetype=model)) +
-  geom_step() +
-  scale_linetype_manual(values = rep(c("solid", "dashed"), length.out=16)) +
-  scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
-  labs(title="ROC curve", x="FPR", "TPR") + theme_bw() + facet_grid(family ~ .)
-ggsave("roc_both.eps", height = 4.5 , width = 6.5, dpi=240)
+ggarrange(p1, p2, ncol=2, common.legend=T, legend="bottom")
+ggsave("metrics_group.eps", height = 5.25 , width = 12, dpi=240)
 ```
 
 ## Regression
@@ -675,7 +678,7 @@ diff.abundant <- list(
 Experiment: 
 
 ```{r}
-fn <- "results_cofounding.csv"
+fn <- "results_regression_count.csv"
 if (file.exists(fn))
 	file.remove(fn)
 
@@ -774,19 +777,20 @@ for (i in 1:n.simulations) {
     results <- rbind(results.tests, results.models)
     results$effect <- effect
     results$experiment <- i
-    suppressWarnings({write.table(results, fn, sep=";", dec=",", append=T, col.names=(i==1) & (effect==effects[[1]]), row.names=F)})
+    suppressWarnings({write.table(results, fn, sep=";", dec=",", append=T, col.names=F, row.names=F)})
   }
 }
 
 ```
 
 ```{r}
-results <- read.table(file="results_cofounding.csv", sep=";", dec=",", header = T)
+results <- read.table(file="results_regression_count.csv", sep=";", dec=",", header = F)
+colnames(results) <- c("family","otu","y_true","type","p_value","y_pred","effect","experiment")
 results <- subset(results, subset = !(family %in% c("oneway_test", "kruskal_test")))
 # Combine model and p-value calculation method into a single factor
 results$model <- factor(paste0(sprintf("%s (%s)", results$family, results$type)), levels=model.names)
-
 ```
+
 
 Table with effect +100%:
 
@@ -798,19 +802,25 @@ stats <- results.1 %>%
   group_by(experiment, model) %>% 
   group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
   group_by(model) %>%
-  summarize(AUC.avg     = round(mean(AUC), 2), 
-            AUC.sd      = round(sd(AUC)/sqrt(n.simulations), 2), 
-            Power.avg   = round(mean(Power), 2), 
+  summarize(AUC.avg     = mean(AUC), 
+            AUC.sd    = round(sd(AUC)/sqrt(n.simulations), 2), 
+            Power.avg   = mean(Power), 
             Power.sd    = round(sd(Power)/sqrt(n.simulations), 2), 
-            FPR.avg     = round(mean(FPR), 2),
-            FPR.sd      = round(sd(FPR)/sqrt(n.simulations), 2)) %>%
-            #PowerAt.avg = round(mean(PowerAt), 2),
-            #PowerAt.sd  = round(sd(PowerAt), 2)) %>%
-  transmute(model=model,
-    AUC   = paste(AUC.avg, sprintf("($\\pm%.2f$)", AUC.sd)),
-    Power = paste(Power.avg, sprintf("($\\pm%.2f$)", Power.sd)),
-    FPR   = paste(FPR.avg, sprintf("($\\pm%.2f$)", FPR.sd)))
-write.csv(stats, "stats_cofounding.csv", row.names=F)
+            FPR.avg     = mean(FPR),
+            FPR.sd    = round(sd(FPR)/sqrt(n.simulations), 2), 
+            PowerAt.avg = mean(PowerAt),
+            PowerAt.sd    = round(sd(PowerAt)/sqrt(n.simulations), 2), 
+            AUCAt.avg   = mean(AUCAt),
+            AUCAt.sd    = round(sd(AUCAt)/sqrt(n.simulations), 2)) %>%
+  mutate(across(where(is.numeric), round, 2)) %>% separate(model, c("Family", "Type"), sep=" ") %>%
+  transmute(Family=Family, Type=Type,
+    #AUC   = sprintf("%.2f ($\\pm%.2f$)", AUC.avg, AUC.sd),
+    Power = sprintf("%.2f ($\\pm%.2f$)", Power.avg, Power.sd),
+    FPR   = sprintf("%.2f ($\\pm%.2f$)", FPR.avg, FPR.sd),
+    PowerAt = sprintf("%.2f ($\\pm%.2f$)", PowerAt.avg, PowerAt.sd),
+    AUCAt   = sprintf("%.2f ($\\pm%.2f$)", AUCAt.avg, AUCAt.sd))  %>%
+  rename("Power"="Power", "FPR"="FPR", "Power@0.05"="PowerAt", "AUC@0.10"="AUCAt")
+write.table(stats, "stats_regression_count.csv", row.names=F, sep=";", dec=",")
 print.data.frame(stats)
 ```
 
@@ -824,39 +834,29 @@ stats <- results.2 %>%
   group_by(experiment, model, effect) %>% 
   group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
   group_by(model, effect) %>%
-  summarize(AUC     = round(mean(AUC), 2), 
-            Power   = round(mean(Power), 2), 
-            FPR     = round(mean(FPR), 2)) %>%
-  pivot_longer(c(AUC, Power, FPR), names_to = "metric", values_to = "value") %>% 
-  mutate(family = recode(model, !!!model.family))
+  summarize(AUC     = mean(AUC), 
+            Power   = mean(Power), 
+            FPR     = mean(FPR), 
+            PowerAt     = mean(PowerAt), 
+            AUCAt     = mean(AUCAt)) %>%
+  pivot_longer(c(AUC, Power, FPR, PowerAt, AUCAt), names_to = "metric", values_to = "value") %>% 
+  mutate(family = recode(model, !!!model.family)) %>% 
+  filter(metric %in% c("Power", "FPR", "PowerAt", "AUCAt")) %>%
+  mutate(metric = factor(metric, levels = c("Power", "FPR", "PowerAt", "AUCAt")))%>% 
+  mutate(metric = recode_factor(metric, Power="Power", FPR="FPR", PowerAt="Power@0.05", AUCAt="AUC@0.10"))
 
 # Plot statistics for each effect size
-ggplot(stats, aes(x=effect, y=value, col=model, linetype=model)) + 
+p1 <- ggplot(stats, aes(x=effect, y=value, col=model, linetype=model)) + 
   geom_line() +
   scale_linetype_manual(values = rep(c("dashed", "solid"), length.out=16)) +
   scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
   facet_grid(family ~ metric) + theme_bw() + #xlab("log(effect)")
-  labs(title="Metrics as a function of effect size", x="Effect size", y="value") +
+  labs(title="Signal in counts: Metrics as a function of effect size", x="Effect size", y="value") +
   scale_x_continuous(trans="log", breaks=c(25, 50, 100, 200, 400), labels=paste0("+",c(25, 50, 100, 200, 400), "%")) + 
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-ggsave("metrics_cofounding.eps", height = 4.5 , width = 6.5, dpi=240)
-```
-
-```{r}
-# Calculate ROC with confidence intervals
-roc <- results.1 %>%
-  group_by(experiment, model) %>%
-  group_modify(~ simple_roc2(.x$y_true, 1-.x$p_value)) %>%
-  group_by(model, TPR) %>%
-  summarize(FPR.mean=mean(FPR))%>% 
-  mutate(family = recode(model, !!!model.family))
-# Plot
-ggplot(roc, aes(x=FPR.mean, y=TPR, col=model, linetype=model)) +
-  geom_step() +
-  scale_linetype_manual(values = rep(c("solid", "dashed"), length.out=16)) +
-  scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
-  labs(title="ROC curve", x="FPR", "TPR") + theme_bw() + facet_grid(family ~ .)
-ggsave("roc_cofounding.eps", height = 4.5 , width = 6.5, dpi=240)
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), 
+        legend.text = element_text(size=10),  #      legend.title = element_blank(), 
+        legend.position="bottom")
+ggsave("metrics_regression_count.eps", height = 5.25 , width = 6.75, dpi=240)
 ```
 
 
@@ -865,7 +865,7 @@ ggsave("roc_cofounding.eps", height = 4.5 , width = 6.5, dpi=240)
 Experiments: 
 
 ```{r}
-fn <- "results_cofounding_both.csv"
+fn <- "results_regression_both.csv"
 if (file.exists(fn))
 	file.remove(fn)
 
@@ -964,7 +964,7 @@ for (i in 1:n.simulations) {
     results <- rbind(results.tests, results.models)
     results$effect <- effect
     results$experiment <- i
-    suppressWarnings({write.table(results, fn, sep=";", dec=",", append=T, col.names=(i==1) & (effect==effects[[1]]), row.names=F)})
+    suppressWarnings({write.table(results, fn, sep=";", dec=",", append=T, col.names=F, row.names=F)})
   }
 }
 
@@ -973,14 +973,13 @@ for (i in 1:n.simulations) {
 
 
 ```{r}
-results <- read.table(file="results_cofounding_both.csv", sep=";", dec=",", header = T)
+results <- read.table(file="results_regression_both.csv", sep=";", dec=",", header = F)
+colnames(results) <- c("family","otu","y_true","type","p_value","y_pred","effect","experiment")
 results <- subset(results, subset = !(family %in% c("oneway_test", "kruskal_test")))
 # Combine model and p-value calculation method into a single factor
 results$model <- factor(paste0(sprintf("%s (%s)", results$family, results$type)), levels=model.names)
 
 ```
-
-Table with effect +100%:
 
 ```{r}
 results.1 <- results %>% filter(effect == 2.0) # results.1 <- results %>% filter(effect == unique(results$effect)[[3]])
@@ -990,23 +989,28 @@ stats <- results.1 %>%
   group_by(experiment, model) %>% 
   group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
   group_by(model) %>%
-  summarize(AUC.avg     = round(mean(AUC), 2), 
-            AUC.sd      = round(sd(AUC)/sqrt(n.simulations), 2), 
-            Power.avg   = round(mean(Power), 2), 
+  summarize(#AUC.avg     = mean(AUC), 
+            #AUC.sd    = round(sd(AUC)/sqrt(n.simulations), 2), 
+            Power.avg   = mean(Power), 
             Power.sd    = round(sd(Power)/sqrt(n.simulations), 2), 
-            FPR.avg     = round(mean(FPR), 2),
-            FPR.sd      = round(sd(FPR)/sqrt(n.simulations), 2)) %>%
-            #PowerAt.avg = round(mean(PowerAt), 2),
-            #PowerAt.sd  = round(sd(PowerAt), 2)) %>%
-  transmute(model=model,
-    AUC   = paste(AUC.avg, sprintf("($\\pm%.2f$)", AUC.sd)),
-    Power = paste(Power.avg, sprintf("($\\pm%.2f$)", Power.sd)),
-    FPR   = paste(FPR.avg, sprintf("($\\pm%.2f$)", FPR.sd)))
-write.csv(stats, "stats_cofounding_both.csv", row.names=F)
+            FPR.avg     = mean(FPR),
+            FPR.sd    = round(sd(FPR)/sqrt(n.simulations), 2), 
+            PowerAt.avg = mean(PowerAt),
+            PowerAt.sd    = round(sd(PowerAt)/sqrt(n.simulations), 2), 
+            AUCAt.avg   = mean(AUCAt),
+            AUCAt.sd    = round(sd(AUCAt)/sqrt(n.simulations), 2)) %>%
+  mutate(across(where(is.numeric), round, 2)) %>% separate(model, c("Family", "Type"), sep=" ") %>%
+  transmute(Family=Family, Type=Type,
+    #AUC   = sprintf("%.2f ($\\pm%.2f$)", AUC.avg, AUC.sd),
+    Power = sprintf("%.2f ($\\pm%.2f$)", Power.avg, Power.sd),
+    FPR   = sprintf("%.2f ($\\pm%.2f$)", FPR.avg, FPR.sd),
+    PowerAt = sprintf("%.2f ($\\pm%.2f$)", PowerAt.avg, PowerAt.sd),
+    AUCAt   = sprintf("%.2f ($\\pm%.2f$)", AUCAt.avg, AUCAt.sd)) %>%
+  rename("Power"="Power", "FPR"="FPR", "Power@0.05"="PowerAt", "AUC@0.10"="AUCAt")
+write.table(stats, "stats_regression_both.csv", row.names=F, sep=";", dec=",")
 print.data.frame(stats)
 ```
 
-Plot with effect sizes +25%, ..., +400%:
 
 ```{r}
 results.2 <- results %>% mutate(effect=(effect-1)*100) # results.2 <- results %>% mutate(effect=(exp(effect)-1)*100)
@@ -1016,40 +1020,76 @@ stats <- results.2 %>%
   group_by(experiment, model, effect) %>% 
   group_modify(~ simple_stats(.x$y_true, .x$p_value)) %>%
   group_by(model, effect) %>%
-  summarize(AUC     = round(mean(AUC), 2), 
-            Power   = round(mean(Power), 2), 
-            FPR     = round(mean(FPR), 2)) %>%
-  pivot_longer(c(AUC, Power, FPR), names_to = "metric", values_to = "value") %>% 
-  mutate(family = recode(model, !!!model.family))
+  summarize(AUC     = mean(AUC), 
+            Power   = mean(Power), 
+            FPR     = mean(FPR), 
+            PowerAt     = mean(PowerAt), 
+            AUCAt     = mean(AUCAt)) %>%
+  pivot_longer(c(AUC, Power, FPR, PowerAt, AUCAt), names_to = "metric", values_to = "value") %>% 
+  mutate(family = recode(model, !!!model.family)) %>% 
+  filter(metric %in% c("Power", "FPR", "PowerAt", "AUCAt")) %>%
+  mutate(metric = factor(metric, levels = c("Power", "FPR", "PowerAt", "AUCAt"))) %>% 
+  mutate(metric = recode_factor(metric, Power="Power", FPR="FPR", PowerAt="Power@0.05", AUCAt="AUC@0.10"))
 
 # Plot statistics for each effect size
-ggplot(stats, aes(x=effect, y=value, col=model, linetype=model)) + 
+p2 <- ggplot(stats, aes(x=effect, y=value, col=model, linetype=model)) + 
   geom_line() +
   scale_linetype_manual(values = rep(c("dashed", "solid"), length.out=16)) +
   scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
   facet_grid(family ~ metric) + theme_bw() + #xlab("log(effect)")
-  labs(title="Metrics as a function of effect size", x="Effect size", y="value") +
+  labs(title="Signal in counts and zeros: Metrics as a function of effect size", x="Effect size", y="value") +
   scale_x_continuous(trans="log", breaks=c(25, 50, 100, 200, 400), labels=paste0("+",c(25, 50, 100, 200, 400), "%")) + 
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-ggsave("metrics_cofounding_both.eps", height = 4.5 , width = 6.5, dpi=240)
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), 
+        legend.text = element_text(size=10),  #      legend.title = element_blank(), 
+        legend.position="bottom")
+ggsave("metrics_regression_both.eps", height = 5.25 , width = 6.75, dpi=240)
 ```
+
+
+```{r}
+ggarrange(p1, p2, ncol=2, common.legend=T, legend="bottom")
+ggsave("metrics_regression.eps", height = 5.25 , width = 12, dpi=240)
+```
+
 
 ```{r}
 # Calculate ROC with confidence intervals
 roc <- results.1 %>%
   group_by(experiment, model) %>%
   group_modify(~ simple_roc2(.x$y_true, 1-.x$p_value)) %>%
-  group_by(model, TPR) %>%
-  summarize(FPR.mean=mean(FPR))%>% 
+  group_by(model, FPR) %>%
+  summarize(TPR.mean=mean(TPR))%>% 
   mutate(family = recode(model, !!!model.family))
 # Plot
-ggplot(roc, aes(x=FPR.mean, y=TPR, col=model, linetype=model)) +
+ggplot(roc, aes(x=FPR, y=TPR.mean, col=model, linetype=model)) +
   geom_step() +
   scale_linetype_manual(values = rep(c("solid", "dashed"), length.out=16)) +
   scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
-  labs(title="ROC curve", x="FPR", "TPR") + theme_bw() + facet_grid(family ~ .)
-ggsave("roc_cofounding_both.eps", height = 4.5 , width = 6.5, dpi=240)
+  labs(title="ROC curve (effect size +100%)", x="FPR", y="TPR") + theme_bw() + facet_grid(family ~ .) 
+ggsave("roc_regression_both.eps", height = 4.5 , width = 6.5, dpi=240)
 ```
+
+```{r}
+mark.1 = stats %>% filter((model == "ZIBetaBinomial (loglik)") & (effect == 100)) %>% pivot_wider(names_from="metric", values_from="value")
+#mark.2 = roc %>% filter((model == "ZIBetaBinomial (loglik)") & (FPR <= 0.10))
+ggplot(roc, aes(x=FPR, y=TPR.mean, col=model, linetype=model)) +
+  geom_step() +
+  scale_linetype_manual(values = rep(c("solid", "dashed"), length.out=16)) +
+  scale_color_manual(values = rep(brewer.pal(8, "Accent"), each=2)) +
+  labs(title="ROC curve", x="FPR", "TPR") + theme_bw() + #facet_grid(family ~ .) + 
+  annotate("segment", y=-0.05, yend=mark.1$`Power@0.05`, x=0.05, xend=0.05, color="#666666")+ 
+  annotate("segment", y=mark.1$`Power@0.05`, yend=mark.1$`Power@0.05`, x=0, xend=0.05, color="#666666") +
+  annotate("segment", y=0, yend=mark.1$Power, x=mark.1$FPR, xend=mark.1$FPR, color="#666666")+ 
+  annotate("segment", y=mark.1$Power, yend=mark.1$Power, x=0, xend=mark.1$FPR, color="#666666") +
+  #annotate("text", y=-0.11, x=0.00, label=".... AUC up to threshold such that FPR = 0.10", color="#666666", hjust = 0, vjust=0, fontface =1) +
+  annotate("text", y=-0.05, x=0.05+0.01, label="TPR at threshold such that FPR = 0.05", color="#666666", hjust = 0, vjust=0, fontface =2) +
+  annotate("text", y=0.01, x=mark.1$FPR+0.01, label="FPR & TPR at threshold set to 0.05", color="#666666", hjust = 0, vjust=0, fontface =2) +
+  labs(x="FPR", y="TPR", title="ROC curve and metric definition") + guides(fill = "none")# +
+  #geom_rect(data=mark.2, aes(xmin=FPR, xmax=lead(FPR), ymin=0, ymax=TPR.mean), fill=NA, lty="dotted", size=0.1)
+ggsave("roc_new.eps", height = 4.5 , width = 6.5, dpi=240)
+```
+
+
 
 ## Finally
 

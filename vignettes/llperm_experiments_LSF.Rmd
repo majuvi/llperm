@@ -1,0 +1,602 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, rows.print=25)
+```
+
+# Running the experiments on the LSF biogrid high-performance cluster
+
+Send the tasks and gather the results after they complete:
+
+```{bash, eval=FALSE}
+./submit_tasks.sh
+# wait for the runs to complete... (run bjobs)
+
+cat /mnt/scratch_dir/viljanem/results_group_count_* > /data/BioGrid/viljanem/results_group_count.csv
+cat /mnt/scratch_dir/viljanem/results_group_both_* > /data/BioGrid/viljanem/results_group_both.csv
+cat /mnt/scratch_dir/viljanem/results_regression_count_* > /data/BioGrid/viljanem/results_regression_count.csv
+cat /mnt/scratch_dir/viljanem/results_regression_both_* > /data/BioGrid/viljanem/results_regression_both.csv
+```
+
+
+Contents of *submit_tasks.sh*:
+
+```{bash, eval=FALSE}
+#!/bin/bash
+for replication in {1..50}
+do
+ for experiment in "group_count" "group_both" "regression_count" "regression_both" 
+ do
+  for effect in 1.25 1.50 2.00 3.00 5.00
+  do
+   bsub Rscript task.R $experiment $replication $effect
+  done
+ done
+done
+```
+
+Contents of *task.R*:
+
+```{r, eval=FALSE}
+library(coin)
+library(llperm)
+library(dplyr)
+library(tidyr)
+
+library(foreach)
+library(doParallel)
+numCores <- 1 #detectCores() 
+registerDoParallel(numCores)
+
+# Generate simulated signal from strata defined by a combination of features, 
+#   each feature value makes given OTUs independently differentially abundant
+generate_signal <- function (strata, sample.size, otu.names, diff.abundant, effects) {
+  # Randomly sample a data frame of features from a given strata definition
+  idx <- sample(1:nrow(strata), sample.size, replace=T, prob=strata$Probability)
+  df.features <- strata[idx,]
+  # Define effects X
+  X <- array(1, c(sample.size,length(otu.names)), list(1:sample.size, otu.names))
+  # Loop over every person and define their OTU effect  
+  for (i in 1:sample.size) {
+    person <- df.features[i,]
+    for (feature in names(diff.abundant)) {
+      otus <- diff.abundant[[feature]][[person[[feature]]]]
+      X[i, otus] = X[i, otus] * effects[[feature]][[person[[feature]]]]
+    }
+  }
+  # These OTUs are truly differentially abundant (affected by Group)
+  diff.abundant <- unique(unlist(diff.abundant$Group))
+  return(list(df.effects=X, df.features=df.features, diff.abundant=diff.abundant))
+}
+
+# Given a real data set of OTU counts, simulate signal in the data set by multiplying counts
+data_simulate <- function(otu.counts, otu.names, strata=NULL, signal, which="both") {
+  # These are the real data OTU counts
+  otu.simulated <- otu.counts[,otu.names]
+  # Add signal and features if relevant
+  if (!is.null(strata)) {
+    if (which != "count") {
+      for (i in 1:ncol(otu.simulated)) {
+        otu.n <- otu.simulated[,i]
+        otu.n.nonzero <- otu.n[otu.n > 0]
+        odds <- sum(otu.n > 0) / sum(otu.n == 0) * signal$df.effects[,i]
+        non.zero <- sample(1:length(otu.n), size=length(otu.n.nonzero), replace=F, prob=1 / (1 + 1/odds))
+        otu.simulated[,i]         <- 0
+        otu.simulated[non.zero,i] <- otu.n.nonzero
+      }
+    }
+    if (which != "zero") 
+      otu.simulated <- round(otu.simulated * signal$df.effects)
+    otu.simulated$library_size <- rowSums(otu.simulated)
+    otu.simulated <- data.frame(otu.simulated, signal$df.features)
+  }
+  return(list(X=otu.simulated, 
+              y=if (!is.null(strata)) signal$diff.abundant else NULL))
+}
+
+str_count <- function(x, s) lengths(regmatches(x, gregexpr(s, x)))
+
+# Loop over generated data sets 
+#i <- 1
+#effect <- 1.25
+
+args = commandArgs(trailingOnly=TRUE)
+experiment <- args[1]
+i <- as.integer(args[2])
+effect <- as.numeric(args[3])
+
+print(sprintf("===== Replication %d =====", i))
+print(sprintf("*** Effect %.2f ***", effect))
+
+fn.sequence <- system.file("extdata", "VEGA_sequences.txt", package = "llperm")
+fn.metadata <- system.file("extdata", "VEGA_metadata.txt", package = "llperm")
+otu.table    <- read.table(fn.sequence, sep="\t", header=T, row.names=1)
+otu.metadata <- read.table(fn.metadata, sep="\t", header=T, row.names=1, stringsAsFactors=T)
+
+otu.names <- colnames(otu.table)
+otu.counts <- cbind(otu.table, otu.metadata)
+otu.counts$Sample <- rownames(otu.counts)
+otu.counts$library_size <- rowSums(otu.table)
+
+set.seed(i)
+
+model.names <- c("Poisson", "ZIPoisson", "NegativeBinomial", "ZINegativeBinomial", 
+                 "Binomial", "ZIBinomial", "BetaBinomial", "ZIBetaBinomial")
+model.names <- with(expand.grid(c("loglik", "llperm"), model.names), paste0(sprintf("%s (%s)", Var2, Var1)))
+#test.names <- with(expand.grid(c("basic"), c("oneway_test", "kruskal_test")), 
+#                   paste0(sprintf("%s (%s)", Var2, Var1)))
+#model.names <- c(test.names, model.names)
+model.family <- setNames(c(rep("Poisson",8), rep("Binomial", 8)), model.names)
+
+
+## Group comparison 
+
+if((experiment == "group_count") | (experiment == "group_both")) {
+	tests <- list(
+	  "oneway_test"          = list(basic="%s ~ Group"),
+	  "kruskal_test"         = list(basic="%s ~ Group")
+	)
+
+	models <- list(
+	  "Poisson"    = "%s ~ Group + offset(log(library_size))",
+	  "Binomial"   = "cbind(%s, library_size - %s) ~ Group ",
+	  "NegativeBinomial"     = "%s ~ Group + offset(log(library_size))",
+	  "BetaBinomial"    = "cbind(%s, library_size - %s) ~ Group ", 
+	  "ZIPoisson"  = "%s ~ Group + offset(log(library_size)) | Group + offset(log(library_size))",
+	  "ZIBinomial" = "cbind(%s, library_size - %s) ~ Group | Group ",
+	  "ZINegativeBinomial"   = "%s ~ Group + offset(log(library_size)) | Group + offset(log(library_size))",
+	  "ZIBetaBinomial"  = "cbind(%s, library_size - %s) ~ Group | Group "
+	)
+
+	# Specify a simple categeorical distribution for each group
+	strata <- data.frame(Group = c("meateater", "fisheater", "vegetarian", "vegan"), 
+		             Probability=c(0.25, 0.25, 0.25, 0.25))
+	# These taxa are differentially abundant in each group
+	diff.abundant <- list(
+	  "Group" = list(
+	    "meateater" = sample(otu.names, length(otu.names)/10),
+	    "fisheater" = sample(otu.names, length(otu.names)/10),
+	    "vegetarian" = sample(otu.names, length(otu.names)/10),
+	    "vegan" = sample(otu.names, length(otu.names)/10)
+	  )
+	)
+}
+
+
+### Signal: counts
+
+if (experiment == "group_count") {
+    # Create simulated signal in real data
+    diff.effects <- list(
+      "Group" = list("meateater" = effect, "fisheater" = effect, "vegetarian" = effect, "vegan" = effect)
+    )
+    signal <- generate_signal(strata, sample.size=nrow(otu.counts), otu.names, diff.abundant, diff.effects)
+    data   <- data_simulate(otu.counts, otu.names, strata=strata, signal, which="count")
+    
+    # This is the data.frame of simulated data and true answers
+    otu.simulated <- data$X
+    otu.simulated$Group <- as.factor(otu.simulated$Group)
+    otu.true <- data.frame(otu=otu.names, y_true=as.integer(otu.names %in% data$y))
+      
+    # Loop over statistical tests
+    results.tests <- list()
+    for (test in names(tests)) {
+      print(test)
+      start <- Sys.time()
+      str.tests <- tests[[test]]
+      testf <- get(test, mode = "function", envir = parent.frame())
+      # Loop over OTUs in paraller
+      results.test <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        pval <- list()
+        for (test.name in names(str.tests)) {
+          str.test <- str.tests[[test.name]]
+          eq <- as.formula(do.call("sprintf", as.list(c(str.test, rep(otu, str_count(str.test, "%s"))))))
+          subset = NULL
+          if (test.name == "strata") {
+            n.in.strata <- table(otu.simulated$Strata)
+            subset = otu.simulated$Strata %in% names(n.in.strata[n.in.strata > 1])
+          }
+          fit <- testf(eq, data=otu.simulated, subset=subset, distribution=approximate(nresample=500))
+          pval[[test.name]] <- pvalue(fit)
+        }
+        otu.result <- c(otu=otu, unlist(pval))
+        otu.result
+      }
+      # Save p-values from different test types
+      results.test <- as.data.frame(results.test) %>% 
+        mutate(basic = basic %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(basic), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      results.tests[[test]] <- results.test
+      # Time per test
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.tests <- bind_rows(results.tests, .id = "family") 
+  
+    # Loop over models
+    results.models <- list()
+    for (model in names(models)) {
+      print(model)
+      start <- Sys.time()
+      str.model <- models[[model]]
+      family <- get(model, mode = "function", envir = parent.frame())
+      
+      # Loop over OTUs in paraller
+      results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+        fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=500, family=family)
+        c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim)
+      }
+      # Save p-values from both log likelihood and prr-test
+      results.model <- as.data.frame(results.model) %>% 
+        mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      
+      results.models[[model]] <- results.model
+      # Time per model
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.models <- bind_rows(results.models, .id = "family") 
+    
+    results <- rbind(results.tests, results.models)
+    results$effect <- effect
+    results$experiment <- i
+}
+
+
+### Signal in counts + zeros
+
+if (experiment == "group_both") {
+    
+    # Create simulated signal in real data
+    diff.effects <- list(
+      "Group" = list("meateater" = effect, "fisheater" = effect, "vegetarian" = effect, "vegan" = effect)
+    )
+    signal <- generate_signal(strata, sample.size=nrow(otu.counts), otu.names, diff.abundant, diff.effects)
+    data   <- data_simulate(otu.counts, otu.names, strata=strata, signal, which="both")
+    
+    # This is the data.frame of simulated data and true answers
+    otu.simulated <- data$X
+    otu.simulated$Group <- as.factor(otu.simulated$Group)
+    otu.true <- data.frame(otu=otu.names, y_true=as.integer(otu.names %in% data$y))
+      
+    # Loop over statistical tests
+    results.tests <- list()
+    for (test in names(tests)) {
+      print(test)
+      start <- Sys.time()
+      str.tests <- tests[[test]]
+      testf <- get(test, mode = "function", envir = parent.frame())
+      # Loop over OTUs in paraller
+      results.test <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        pval <- list()
+        for (test.name in names(str.tests)) {
+          str.test <- str.tests[[test.name]]
+          eq <- as.formula(do.call("sprintf", as.list(c(str.test, rep(otu, str_count(str.test, "%s"))))))
+          subset = NULL
+          if (test.name == "strata") {
+            n.in.strata <- table(otu.simulated$Strata)
+            subset = otu.simulated$Strata %in% names(n.in.strata[n.in.strata > 1])
+          }
+          fit <- testf(eq, data=otu.simulated, subset=subset, distribution=approximate(nresample=500))
+          pval[[test.name]] <- pvalue(fit)
+        }
+        otu.result <- c(otu=otu, unlist(pval))
+        otu.result
+      }
+      # Save p-values from different test types
+      results.test <- as.data.frame(results.test) %>% 
+        mutate(basic = basic %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(basic), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      results.tests[[test]] <- results.test
+      # Time per test
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.tests <- bind_rows(results.tests, .id = "family") 
+  
+    # Loop over models
+    results.models <- list()
+    for (model in names(models)) {
+      print(model)
+      start <- Sys.time()
+      str.model <- models[[model]]
+      family <- get(model, mode = "function", envir = parent.frame())
+      
+      # Loop over OTUs in paraller
+      results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+        fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=500, family=family)
+        c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim)
+      }
+      # Save p-values from both log likelihood and prr-test
+      results.model <- as.data.frame(results.model) %>% 
+        mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      
+      results.models[[model]] <- results.model
+      # Time per model
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.models <- bind_rows(results.models, .id = "family") 
+
+    results <- rbind(results.tests, results.models)
+    results$effect <- effect
+    results$experiment <- i
+}
+
+
+# Regression
+
+if((experiment == "regression_count") | (experiment == "regression_both")) {
+
+	tests <- list(
+	  "oneway_test"          = list(basic="%s ~ Group", strata="%s ~ Group | Strata"),
+	  "kruskal_test"         = list(basic="%s ~ Group", strata="%s ~ Group | Strata")
+	)
+
+	models <- list(
+	  "Poisson"    = "%s ~ Group + Covariate + Age + offset(log(library_size))",
+	  "Binomial"   = "cbind(%s, library_size - %s) ~ Group + Covariate + Age",
+	  "NegativeBinomial"     = "%s ~ Group + Covariate + Age + offset(log(library_size))",
+	  "BetaBinomial"    = "cbind(%s, library_size - %s) ~ Group + Covariate + Age", 
+	  "ZIPoisson"  = "%s ~ Group + Covariate + Age + offset(log(library_size)) | Group + Covariate + Age + offset(log(library_size))",
+	  "ZIBinomial" = "cbind(%s, library_size - %s) ~ Group + Covariate + Age | Group + Covariate + Age",
+	  "ZINegativeBinomial"   = "%s ~ Group + Covariate + Age + offset(log(library_size)) | Group + Covariate + Age + offset(log(library_size))",
+	  "ZIBetaBinomial"  = "cbind(%s, library_size - %s) ~ Group + Covariate + Age | Group + Covariate + Age"
+	)
+
+	ages <- as.character(seq(20,69))
+	strata.1 <- data.frame(Group = rep(c("meateater", "fisheater", "vegetarian", "vegan"), 2), 
+		               Covariate= c(rep("urbanlow", 4), rep("urbanhigh", 4)),
+		               Probability=c(c(0.4, 0.3, 0.2, 0.1)/2, c(0.1, 0.2, 0.3, 0.4)/2))
+	strata.2 <- data.frame(Group = c(rep("meateater", 50), rep("fisheater", 50), rep("vegetarian", 50), rep("vegan", 50)), 
+		               Age = rep(ages, 4),
+		               Probability=c(c(rep(0.00,10)/10, rep(0.10,10)/10, rep(0.20,10)/10, rep(0.30,10)/10, rep(0.40,10)/10), 
+		                             c(rep(0.10,10)/10, rep(0.15,10)/10, rep(0.20,10)/10, rep(0.25,10)/10, rep(0.30,10)/10),
+		                             c(rep(0.30,10)/10, rep(0.25,10)/10, rep(0.20,10)/10, rep(0.15,10)/10, rep(0.10,10)/10),
+		                             c(rep(0.40,10)/10, rep(0.30,10)/10, rep(0.20,10)/10, rep(0.10,10)/10, rep(0.00,10)/10)))
+	# Alternative: binned age
+	# strata.2 <- data.frame(Group = c(rep("meateater", 5), rep("fisheater", 5), rep("vegetarian", 5), rep("vegan", 5)), 
+	#                        Age=rep(c(20, 30, 40, 50, 60), 2),
+	#                        Probability=c(c(0.00, 0.10, 0.20, 0.30, 0.40), 
+	#                                      c(0.10, 0.15, 0.20, 0.25, 0.30),
+	#                                      c(0.30, 0.25, 0.20, 0.15, 0.10),
+	#                                      c(0.40, 0.30, 0.20, 0.10, 0.0)))
+	strata <- merge(strata.1, strata.2, by="Group")
+	strata$Probability = strata$Probability.x * strata$Probability.y
+	strata$Probability.x <- NULL
+	strata$Probability.y <- NULL
+
+	# Same OTUs are differentially abundant for each age, but the effect increases linearly over age
+	age.otus <- sample(otu.names, length(otu.names)/10)
+	age.diff <- setNames(lapply(ages, function (age) age.otus), ages)
+	age.effect <- setNames(exp(seq(log(1),log(5),length.out=50)), ages)
+
+	# These taxa are differentially abundant in each group
+	diff.abundant <- list(
+	  "Group" = list(
+	    "meateater" = sample(otu.names, length(otu.names)/10),
+	    "fisheater" = sample(otu.names, length(otu.names)/10),
+	    "vegetarian" = sample(otu.names, length(otu.names)/10),
+	    "vegan" = sample(otu.names, length(otu.names)/10)
+	  ),
+	  "Covariate" = list(
+	    "urbanlow" = sample(otu.names, length(otu.names)/10),
+	    "urbanhigh" = sample(otu.names, length(otu.names)/10)
+	  ),
+	  "Age" = age.diff
+	)
+}
+
+
+### Signal: counts (with co-founding)
+
+if (experiment == "regression_count") {
+    # Create simulated signal in real data
+    diff.effects <- list(
+      "Group" = list("meateater" = effect, "fisheater" = effect, "vegetarian" = effect, "vegan" = effect), 
+      "Covariate" = list("urbanlow" = 3, "urbanhigh" = 3),
+      "Age" = age.effect
+    )
+    signal <- generate_signal(strata, sample.size=nrow(otu.counts), otu.names, diff.abundant, diff.effects)
+    data <- data_simulate(otu.counts, otu.names, strata=strata, signal, which="count")
+    
+    # This is the data.frame of simulated data and true answers
+    otu.simulated <- data$X
+    otu.simulated$Group = as.factor(otu.simulated$Group)
+    otu.simulated$Covariate = as.factor(otu.simulated$Covariate)
+    otu.simulated$Age = as.numeric(otu.simulated$Age)
+    otu.simulated$AgeCat = cut(otu.simulated$Age, c(20,30,40,50,60,70), right=F)
+    otu.simulated$Strata <- factor(with(otu.simulated, paste(Covariate, AgeCat, sep=",")))
+    otu.true <- data.frame(otu=otu.names, y_true=as.integer(otu.names %in% data$y))
+    
+    # Loop over statistical tests
+    results.tests <- list()
+    for (test in names(tests)) {
+      print(test)
+      start <- Sys.time()
+      str.tests <- tests[[test]]
+      testf <- get(test, mode = "function", envir = parent.frame())
+      # Loop over OTUs in paraller
+      results.test <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        pval <- list()
+        for (test.name in names(str.tests)) {
+          str.test <- str.tests[[test.name]]
+          eq <- as.formula(do.call("sprintf", as.list(c(str.test, rep(otu, str_count(str.test, "%s"))))))
+          subset = NULL
+          if (test.name == "strata") {
+            n.in.strata <- table(otu.simulated$Strata)
+            subset = otu.simulated$Strata %in% names(n.in.strata[n.in.strata > 1])
+          }
+          fit <- testf(eq, data=otu.simulated, subset=subset, distribution=approximate(nresample=500))
+          pval[[test.name]] <- pvalue(fit)
+        }
+        otu.result <- c(otu=otu, unlist(pval))
+        otu.result
+      }
+      # Save p-values from different test types
+      results.test <- as.data.frame(results.test) %>% 
+        mutate(basic = basic %>% as.numeric, strata = strata %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(basic, strata), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      results.tests[[test]] <- results.test
+      # Time per test
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.tests <- bind_rows(results.tests, .id = "family") 
+  
+    # Loop over models
+    results.models <- list()
+    for (model in names(models)) {
+      print(model)
+      start <- Sys.time()
+      str.model <- models[[model]]
+      family <- get(model, mode = "function", envir = parent.frame())
+      
+      # Loop over OTUs in paraller
+      results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+        fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=500, family=family)
+        c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim)
+      }
+      # Save p-values from both log likelihood and prr-test
+      results.model <- as.data.frame(results.model) %>% 
+        mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      
+      results.models[[model]] <- results.model
+      # Time per model
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.models <- bind_rows(results.models, .id = "family") 
+    
+    results <- rbind(results.tests, results.models)
+    results$effect <- effect
+    results$experiment <- i
+}
+
+
+### Signal: counts + zeros (with co-founding)
+
+if (experiment == "regression_both") {
+    # Create simulated signal in real data
+    diff.effects <- list(
+      "Group" = list("meateater" = effect, "fisheater" = effect, "vegetarian" = effect, "vegan" = effect), 
+      "Covariate" = list("urbanlow" = 3, "urbanhigh" = 3),
+      "Age" = age.effect
+    )
+    signal <- generate_signal(strata, sample.size=nrow(otu.counts), otu.names, diff.abundant, diff.effects)
+    data <- data_simulate(otu.counts, otu.names, strata=strata, signal, which="both")
+    
+    # This is the data.frame of simulated data and true answers
+    otu.simulated <- data$X
+    otu.simulated$Group = as.factor(otu.simulated$Group)
+    otu.simulated$Covariate = as.factor(otu.simulated$Covariate)
+    otu.simulated$Age = as.numeric(otu.simulated$Age)
+    otu.simulated$AgeCat = cut(otu.simulated$Age, c(20,30,40,50,60,70), right=F)
+    otu.simulated$Strata <- factor(with(otu.simulated, paste(Covariate, AgeCat, sep=",")))
+    otu.true <- data.frame(otu=otu.names, y_true=as.integer(otu.names %in% data$y))
+    
+    # Loop over statistical tests
+    results.tests <- list()
+    for (test in names(tests)) {
+      print(test)
+      start <- Sys.time()
+      str.tests <- tests[[test]]
+      testf <- get(test, mode = "function", envir = parent.frame())
+      # Loop over OTUs in paraller
+      results.test <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        pval <- list()
+        for (test.name in names(str.tests)) {
+          str.test <- str.tests[[test.name]]
+          eq <- as.formula(do.call("sprintf", as.list(c(str.test, rep(otu, str_count(str.test, "%s"))))))
+          subset = NULL
+          if (test.name == "strata") {
+            n.in.strata <- table(otu.simulated$Strata)
+            subset = otu.simulated$Strata %in% names(n.in.strata[n.in.strata > 1])
+          }
+          fit <- testf(eq, data=otu.simulated, subset=subset, distribution=approximate(nresample=500))
+          pval[[test.name]] <- pvalue(fit)
+        }
+        otu.result <- c(otu=otu, unlist(pval))
+        otu.result
+      }
+      # Save p-values from different test types
+      results.test <- as.data.frame(results.test) %>% 
+        mutate(basic = basic %>% as.numeric, strata = strata %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(basic, strata), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      results.tests[[test]] <- results.test
+      # Time per test
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.tests <- bind_rows(results.tests, .id = "family") 
+  
+    # Loop over models
+    results.models <- list()
+    for (model in names(models)) {
+      print(model)
+      start <- Sys.time()
+      str.model <- models[[model]]
+      family <- get(model, mode = "function", envir = parent.frame())
+      
+      # Loop over OTUs in paraller
+      results.model <- foreach (i=1:length(otu.names), .combine=rbind) %dopar% {
+        otu <- otu.names[[i]]
+        eq <- as.formula(do.call("sprintf", as.list(c(str.model, rep(otu, str_count(str.model, "%s"))))))
+        fit <- prr.test.ll(eq, otu.simulated, test.var="Group", test="both", n.rep=500, family=family)
+        c(otu=otu, loglik=fit$p.value.obs, llperm=fit$p.value.sim)
+      }
+      # Save p-values from both log likelihood and prr-test
+      results.model <- as.data.frame(results.model) %>% 
+        mutate(loglik = loglik %>% as.numeric, llperm = llperm %>% as.numeric) %>% 
+        inner_join(otu.true, by="otu") %>% 
+        pivot_longer(c(loglik, llperm), names_to="type", values_to="p_value") %>%
+        mutate(y_pred = p_value <= 0.05)
+      
+      results.models[[model]] <- results.model
+      # Time per model
+      end <- Sys.time()
+      print(end-start)
+    }
+    results.models <- bind_rows(results.models, .id = "family") 
+    
+    results <- rbind(results.tests, results.models)
+    results$effect <- effect
+    results$experiment <- i
+}
+
+save.path <- "/mnt/scratch_dir/viljanem"
+save.file <- sprintf("results_%s_%03d_%.2f.csv", experiment, i, effect)
+fn <- file.path(save.path, save.file)
+suppressWarnings({write.table(results, fn, sep=";", dec=",", col.names=F, row.names=F)})
+```
+
